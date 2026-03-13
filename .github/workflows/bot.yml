@@ -1,0 +1,30 @@
+name: Bot Eventos Gratis Santiago
+ 
+on:
+  schedule:
+    - cron: "0 12 * * *"   # 9:00 AM hora Chile
+    - cron: "0 18 * * *"   # 3:00 PM hora Chile
+  workflow_dispatch:
+ 
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+ 
+      - name: Install dependencies
+        run: pip install httpx google-generativeai
+ 
+      - name: Run bot
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
