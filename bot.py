@@ -27,10 +27,11 @@ QUERIES = [
     "site:instagram.com inauguración gratis Santiago",
 ]
 
-SYSTEM_PROMPT = f"""Eres un filtro estricto de eventos para Santiago de Chile.
-Hoy es {hoy}. Mañana es {manana}. El año actual es {anio_actual}.
+SYSTEM_PROMPT = f"""Eres un filtro de eventos gratuitos para Santiago de Chile.
+Hoy es {hoy}. El año actual es {anio_actual}.
 
-Recibiras un resultado de búsqueda web (título + snippet + url) y debes responder SOLO con un JSON así:
+Recibirás un resultado de búsqueda web (título + snippet + url).
+Responde SOLO con este JSON, sin texto adicional:
 {{
   "aprobado": true/false,
   "nombre": "Nombre del evento",
@@ -40,18 +41,17 @@ Recibiras un resultado de búsqueda web (título + snippet + url) y debes respon
   "link": "URL original"
 }}
 
-Aprueba SOLO si cumple TODO:
-1. Es en Santiago de Chile (no otra ciudad)
-2. Es GRATIS o gratuito (sin costo de entrada)
-3. Es un evento puntual/express: degustación, inauguración, pop-up, activación de marca, evento cultural de un día
-4. La fecha del evento es en {anio_actual} Y dentro de los próximos 3 días desde hoy ({hoy})
-   — RECHAZA cualquier evento de {anio_actual - 1} o años anteriores
-   — RECHAZA si la fecha del evento ya pasó
-   — RECHAZA si el snippet no menciona una fecha concreta o menciona solo "próximamente"
-5. NO es un lugar permanente (museo siempre gratis, parque, etc.)
+APRUEBA si cumple TODO esto:
+1. El evento es en Santiago de Chile
+2. Es gratuito/gratis (sin costo de entrada)
+3. Es un evento puntual: degustación, inauguración, pop-up, activación de marca, feria, evento cultural de un día
+4. La fecha del evento es próxima (hoy, mañana o dentro de los próximos 5 días)
+   — Si no hay fecha explícita pero el contexto sugiere que es actual/próximo, APRUEBA con fecha_hora: "Consultar en el link"
+   — Solo RECHAZA por fecha si la fecha mencionada claramente ya pasó (ej: "15 de enero de 2025")
+5. NO es un lugar permanente (museo, parque, etc.)
 
-Si hay CUALQUIER duda sobre la fecha o el año, devuelve aprobado: false.
-Responde SOLO el JSON, sin texto adicional."""
+En caso de duda, APRUEBA — es mejor enviar un falso positivo que perder un evento real.
+Responde SOLO el JSON."""
 
 
 # ── Tavily search ────────────────────────────────────────────────────────────
@@ -78,8 +78,14 @@ async def tavily_search(client: httpx.AsyncClient, query: str) -> list[dict]:
 
 # ── Groq filter ─────────────────────────────────────────────────────────────
 def groq_evaluar(resultado: dict) -> dict | None:
+    import json
     groq = Groq(api_key=GROQ_API_KEY)
-    contenido = f"Título: {resultado.get('title','')}\nSnippet: {resultado.get('content','')}\nURL: {resultado.get('url','')}"
+    contenido = (
+        f"Título: {resultado.get('title','')}\n"
+        f"Snippet: {resultado.get('content','')}\n"
+        f"Fecha publicación: {resultado.get('published_date', 'desconocida')}\n"
+        f"URL: {resultado.get('url','')}"
+    )
     try:
         chat = groq.chat.completions.create(
             model=GROQ_MODEL,
@@ -90,8 +96,8 @@ def groq_evaluar(resultado: dict) -> dict | None:
             temperature=0.1,
             max_tokens=300,
         )
-        import json
         raw = chat.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
         return data if data.get("aprobado") else None
     except Exception as e:
@@ -126,11 +132,9 @@ async def main():
     urls_vistas: set[str] = set()
 
     async with httpx.AsyncClient() as client:
-        # Búsquedas en paralelo
         tasks = [tavily_search(client, q) for q in QUERIES]
         resultados_por_query = await asyncio.gather(*tasks)
 
-        # Deduplicar y evaluar
         todos: list[dict] = []
         for resultados in resultados_por_query:
             for r in resultados:
@@ -142,20 +146,14 @@ async def main():
         print(f"[Info] {len(todos)} resultados únicos para evaluar")
 
         for r in todos:
-            # Pre-filtro barato: descartar si el snippet menciona solo años viejos
-            contenido_raw = (r.get("title", "") + r.get("content", "")).lower()
-            anios_viejos = [str(a) for a in range(2020, anio_actual)]
-            if any(f" {a} " in contenido_raw or f"/{a}" in contenido_raw for a in anios_viejos):
-                if str(anio_actual) not in contenido_raw:
-                    print(f"[Skipped - año viejo] {r.get('title','')[:60]}")
-                    continue
-
+            print(f"[Evaluando] {r.get('title','')[:70]}")
             ev = groq_evaluar(r)
             if ev:
                 aprobados.append(ev)
                 print(f"[Aprobado] {ev['nombre']}")
+            else:
+                print(f"[Rechazado]")
 
-        # Enviar por Telegram
         if not aprobados:
             await telegram_send(client, "🔍 <b>Eventos gratis Santiago</b>\n\nNo encontré eventos gratuitos express para hoy o mañana. ¡Intenta más tarde!")
         else:
