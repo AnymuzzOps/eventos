@@ -14,6 +14,7 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 
 hoy    = datetime.now().strftime("%d de %B de %Y")
 manana = (datetime.now() + timedelta(days=1)).strftime("%d de %B de %Y")
+anio_actual = datetime.now().year
 
 QUERIES = [
     "evento gratis Santiago hoy",
@@ -27,7 +28,7 @@ QUERIES = [
 ]
 
 SYSTEM_PROMPT = f"""Eres un filtro estricto de eventos para Santiago de Chile.
-Hoy es {hoy}. Mañana es {manana}.
+Hoy es {hoy}. Mañana es {manana}. El año actual es {anio_actual}.
 
 Recibiras un resultado de búsqueda web (título + snippet + url) y debes responder SOLO con un JSON así:
 {{
@@ -43,11 +44,13 @@ Aprueba SOLO si cumple TODO:
 1. Es en Santiago de Chile (no otra ciudad)
 2. Es GRATIS o gratuito (sin costo de entrada)
 3. Es un evento puntual/express: degustación, inauguración, pop-up, activación de marca, evento cultural de un día
-4. La fecha es hoy o mañana (o muy próximo, dentro de 3 días)
+4. La fecha del evento es en {anio_actual} Y dentro de los próximos 3 días desde hoy ({hoy})
+   — RECHAZA cualquier evento de {anio_actual - 1} o años anteriores
+   — RECHAZA si la fecha del evento ya pasó
+   — RECHAZA si el snippet no menciona una fecha concreta o menciona solo "próximamente"
 5. NO es un lugar permanente (museo siempre gratis, parque, etc.)
-6. Tiene información concreta (no es solo un artículo genérico)
 
-Si falta info clave o no cumple algún punto, devuelve aprobado: false.
+Si hay CUALQUIER duda sobre la fecha o el año, devuelve aprobado: false.
 Responde SOLO el JSON, sin texto adicional."""
 
 
@@ -62,7 +65,7 @@ async def tavily_search(client: httpx.AsyncClient, query: str) -> list[dict]:
                 "search_depth": "basic",
                 "max_results": 5,
                 "include_answer": False,
-                "days": 2,
+                "days": 3,
             },
             timeout=20,
         )
@@ -139,6 +142,14 @@ async def main():
         print(f"[Info] {len(todos)} resultados únicos para evaluar")
 
         for r in todos:
+            # Pre-filtro barato: descartar si el snippet menciona solo años viejos
+            contenido_raw = (r.get("title", "") + r.get("content", "")).lower()
+            anios_viejos = [str(a) for a in range(2020, anio_actual)]
+            if any(f" {a} " in contenido_raw or f"/{a}" in contenido_raw for a in anios_viejos):
+                if str(anio_actual) not in contenido_raw:
+                    print(f"[Skipped - año viejo] {r.get('title','')[:60]}")
+                    continue
+
             ev = groq_evaluar(r)
             if ev:
                 aprobados.append(ev)
