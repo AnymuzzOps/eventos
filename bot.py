@@ -21,14 +21,26 @@ hoy         = ahora.strftime(”%d de %B de %Y”)
 hoy_iso     = hoy_dt.isoformat()
 mes_actual  = ahora.month
 
+# Fecha dinámica para queries más precisos
+
+fecha_corta = ahora.strftime(”%-d de %B”)   # ej: “14 de marzo”
+dia_semana  = ahora.strftime(”%A”).lower()   # ej: “sábado”
+
 QUERIES = [
+# Queries con fecha explícita del día — más precisos
+f”evento gratis Santiago {fecha_corta}”,
+f”degustación gratis Santiago {fecha_corta}”,
+f”inauguración gratis Santiago {fecha_corta}”,
+# Queries generales con señal temporal
 “evento gratis Santiago hoy”,
 “inauguración gratuita Santiago esta semana”,
-“degustación gratis Santiago”,
-“activación gratuita marca Santiago”,
+“degustación gratis Santiago esta semana”,
 “pop-up gratuito entrada libre Santiago”,
-“feria gratuita Santiago este fin de semana”,
 “concierto gratis Santiago hoy”,
+# Fuentes locales conocidas de eventos Santiago
+“site:santiagoadicto.cl evento gratis”,
+“site:agendacultural.cl evento gratis Santiago”,
+“site:portalcultural.cl actividad gratuita”,
 “site:instagram.com evento gratis Santiago hoy”,
 ]
 
@@ -139,7 +151,7 @@ json={
 “search_depth”: “basic”,
 “max_results”: 5,
 “include_answer”: False,
-“days”: 1,
+“days”: 2,
 },
 timeout=20,
 )
