@@ -17,6 +17,8 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GROQ_MODEL = "llama-3.3-70b-versatile"
 PROCESADAS_PATH = Path("procesadas.txt")
 MAX_EVENTOS = 8
+MAX_CANDIDATOS_GROQ = 18
+EXTRACT_CHARS = 4000
 
 CHILE_TZ = timezone(timedelta(hours=-3))
 ahora = datetime.now(CHILE_TZ)
@@ -25,22 +27,11 @@ hoy = ahora.strftime("%-d de %B de %Y")
 hoy_iso = hoy_dt.isoformat()
 ANO_OBJETIVO = 2026
 FECHA_MINIMA = date(2026, 3, 19)
+FECHA_MAXIMA = date(2026, 5, 31)
+MESES_BUSQUEDA = ["marzo 2026", "abril 2026", "mayo 2026"]
 
-QUERIES = [
-    f"eventos gratis exclusivos Santiago Chile {ANO_OBJETIVO}",
-    f"inauguración gratis Santiago Chile marzo {ANO_OBJETIVO}",
-    f"degustación gratis Santiago Chile marzo {ANO_OBJETIVO}",
-    f"pop up exclusivo gratis Santiago Chile marzo {ANO_OBJETIVO}",
-    f"lanzamiento gratuito marca Santiago Chile marzo {ANO_OBJETIVO}",
-    f"activación gratis Santiago centro marzo {ANO_OBJETIVO}",
-    f"site:instagram.com Santiago Chile inauguración gratis marzo {ANO_OBJETIVO}",
-    f"site:instagram.com Santiago Chile degustación gratis marzo {ANO_OBJETIVO}",
-    f"site:tiktok.com Santiago Chile inauguración marzo {ANO_OBJETIVO}",
-    f"site:santiagocultura.cl Santiago inauguración marzo {ANO_OBJETIVO}",
-    f"site:chilecultura.gob.cl Santiago marzo {ANO_OBJETIVO} evento gratis",
-    f"site:instagram.com Santiago centro experiencia gratis {ANO_OBJETIVO}",
-]
 
+# ── Diccionarios ─────────────────────────────────────────────────────────────
 CATEGORIAS = {
     "degustacion": "🍷 Degustación",
     "inauguracion": "🎊 Inauguración",
@@ -56,7 +47,9 @@ CATEGORIAS = {
 COMUNAS_PERMITIDAS = {
     "santiago",
     "santiago centro",
+    "centro de santiago",
     "casco histórico",
+    "casco historico",
     "lastarria",
     "bellas artes",
     "barrio yungay",
@@ -68,8 +61,26 @@ COMUNAS_PERMITIDAS = {
     "gam",
     "baquedano",
     "alameda",
-    "estación central",  # útil si el texto viene mezclado con Santiago Centro
+    "matucana",
+    "recoleta",
+    "patronato",
+    "estación central",
+    "estacion central",
 }
+
+COMUNAS_EXCLUIDAS = [
+    "providencia",
+    "las condes",
+    "vitacura",
+    "ñuñoa",
+    "nunoa",
+    "maipú",
+    "maipu",
+    "la reina",
+    "peñalolén",
+    "penalolen",
+    "lo barnechea",
+]
 
 KEYWORDS_EXCLUSIVOS = [
     "inaugur",
@@ -94,6 +105,9 @@ KEYWORDS_EXCLUSIVOS = [
     "popup",
     "intervención",
     "intervencion",
+    "gratis",
+    "entrada liberada",
+    "free entry",
 ]
 
 KEYWORDS_ESTAFA = [
@@ -111,17 +125,20 @@ KEYWORDS_ESTAFA = [
     "abono",
     "pirámide",
     "piramide",
+    "mentor financiero",
+    "inversión garantizada",
+    "inversion garantizada",
 ]
 
-DOMINIOS_BLOQUEADOS = {
-    "eventbrite.com",
-    "eventbrite.cl",
-    "ticketplus.cl",
-    "puntoticket.com",
-    "freetour.com",
-    "emprende.cl",
-    "facebook.com",
-}
+KEYWORDS_GRATIS = [
+    "gratis",
+    "gratuito",
+    "gratuita",
+    "entrada liberada",
+    "entrada libre",
+    "sin costo",
+    "free",
+]
 
 TITULO_BASURA = [
     "10 panoramas",
@@ -144,12 +161,38 @@ TITULO_BASURA = [
     "tour gastronomico",
 ]
 
-SYSTEM_PROMPT = f"""Eres un verificador MUY ESTRICTO de eventos presenciales gratis.
+DOMINIOS_BLOQUEADOS = {
+    "eventbrite.com",
+    "eventbrite.cl",
+    "ticketplus.cl",
+    "puntoticket.com",
+    "freetour.com",
+    "emprende.cl",
+    "facebook.com",
+}
+
+DOMINIOS_PRIORITARIOS = {
+    "instagram.com",
+    "tiktok.com",
+    "santiagocultura.cl",
+    "chilecultura.gob.cl",
+    "santiagoturismo.cl",
+    "biobiochile.cl",
+    "publimetro.cl",
+    "theclinic.cl",
+    "df.cl",
+    "latercera.com",
+}
+
+
+# ── Prompt ──────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = f"""Eres un verificador de eventos presenciales gratis.
 
 Fecha actual de referencia: {hoy_iso}.
-Solo apruebas eventos que ocurren en Santiago de Chile, DESPUÉS del 2026-03-18.
+Debes encontrar eventos en Santiago de Chile posteriores al 2026-03-18.
+El objetivo es detectar eventos reales y atractivos como inauguraciones, degustaciones gratis, activaciones, lanzamientos, pop-ups temporales o experiencias especiales.
 
-Responde SOLO JSON:
+Responde SOLO JSON.
 Si apruebas:
 {{
   "ok": true,
@@ -159,34 +202,60 @@ Si apruebas:
   "fecha": "texto legible",
   "fecha_iso": "YYYY-MM-DD",
   "hora": "HH:MM o null",
-  "desc": "qué pasa y por qué vale la pena",
+  "desc": "resumen claro del evento",
   "cat": "degustacion|inauguracion|popup|activacion|arte|feria|musica|experiencia|otro",
   "gratis": true,
   "exclusive_score": 0-5,
-  "motivo_exclusivo": "por qué se siente especial/exclusivo",
+  "motivo_exclusivo": "por qué se siente especial o distinto",
+  "evidencia_fecha": "qué texto o dato respalda la fecha",
   "fuente": "instagram|tiktok|web",
   "link": "..."
 }}
 Si rechazas:
 {{"ok": false, "r": "motivo breve"}}
 
-APRUEBA solo si TODO esto se cumple:
-- Evento presencial en Santiago de Chile.
-- Fecha real verificable entre 2026-03-19 y 2026-12-31.
-- Gratis / entrada liberada / sin pago.
-- Debe ser específico y atractivo: inauguración, degustación gratis, activación, lanzamiento, pop-up temporal, experiencia o evento especial.
-- Debe verse como algo puntual y no una nota vieja, resumen, reel reutilizado o simple video mostrando un lugar.
-- Debe incluir al menos nombre o marca/espacio reconocible + lugar concreto.
+APRUEBA si se cumplen estas condiciones:
+- Es un evento presencial en Santiago de Chile.
+- La fecha del evento es verificable y ocurre entre 2026-03-19 y 2026-05-31.
+- Se ve gratis o entrada liberada.
+- Hay suficiente evidencia en título, snippet o contenido extraído.
+- Puede ser exclusivo por formato, marca, apertura, experiencia puntual o cupos limitados. No hace falta que use la palabra "exclusivo" literal.
 
-RECHAZA si detectas cualquiera de estos casos:
-- Fecha de 2025 o anterior, o fecha ambigua sin evidencia.
-- Contenido que solo habla de cómo quedó un lugar, sin evento real.
-- Artículo/lista/agenda genérica.
-- Evento fuera de Santiago.
-- Venta, feria comercial común, clases, tour permanente, inscripción, ticketing.
-- MLM, pirámide, captación, negocio coreano, "gana dinero", networking engañoso.
-- Publicación reciente que promociona algo ya ocurrido.
+RECHAZA si pasa cualquiera de estas cosas:
+- El contenido solo muestra un lugar o resume panoramas, sin evento puntual.
+- Publicación reciente sobre un evento ya terminado.
+- Fecha 2025 o anterior, o sin evidencia mínima.
+- Es venta, ticketing, curso, feria comercial común, tour permanente o pauta evergreen.
+- Es MLM, captación, seminario para ganar dinero o posible estafa.
+- Está fuera de Santiago.
+
+Si la evidencia es parcial pero razonable, aprueba solo si la fecha y gratuidad están respaldadas por el contenido.
 """
+
+
+# ── Queries ─────────────────────────────────────────────────────────────────
+def construir_queries() -> list[str]:
+    queries = [
+        f"eventos gratis Santiago Chile {ANO_OBJETIVO}",
+        f"inauguración gratis Santiago Chile {MESES_BUSQUEDA[0]}",
+        f"degustación gratis Santiago Chile {MESES_BUSQUEDA[0]}",
+        f"pop up Santiago centro gratis {MESES_BUSQUEDA[0]}",
+        f"activación gratis Santiago centro {MESES_BUSQUEDA[0]}",
+        f"lanzamiento gratis Santiago Chile {MESES_BUSQUEDA[0]}",
+        f"site:instagram.com/p/ inauguración Santiago gratis {MESES_BUSQUEDA[0]}",
+        f"site:instagram.com/p/ degustación gratis Santiago {MESES_BUSQUEDA[0]}",
+        f"site:instagram.com/p/ apertura tienda gratis Santiago {MESES_BUSQUEDA[1]}",
+        f"site:tiktok.com inauguración Santiago centro {MESES_BUSQUEDA[0]}",
+        f"site:santiagocultura.cl Santiago gratis {MESES_BUSQUEDA[0]}",
+        f"site:chilecultura.gob.cl Santiago gratis {MESES_BUSQUEDA[0]}",
+        f"site:santiagoturismo.cl Santiago evento gratis marzo 2026",
+        f"site:biobiochile.cl degustación gratis Santiago marzo 2026",
+        f"site:latercera.com pop up Santiago marzo 2026 gratis",
+    ]
+    return queries
+
+
+QUERIES = construir_queries()
 
 
 # ── Cache de procesadas ─────────────────────────────────────────────────────
@@ -237,51 +306,96 @@ def contiene_keywords(texto: str, keywords: list[str]) -> bool:
     return any(k in texto for k in keywords)
 
 
-# ── Pre-filtro Python (sin IA, sin costo) ────────────────────────────────────
-def prefiltro(r: dict) -> tuple[bool, str]:
-    url = r.get("url", "")
-    dominio = extraer_dominio(url)
-    titulo = normalizar(r.get("title", ""))
-    snippet = normalizar(r.get("content", ""))
-    texto = f"{titulo} {snippet}"
+def extraer_texto_base(r: dict) -> str:
+    return " ".join(
+        [
+            normalizar(r.get("title", "")),
+            normalizar(r.get("content", "")),
+            normalizar(r.get("raw_content", "")),
+        ]
+    ).strip()
 
-    if any(d in dominio for d in DOMINIOS_BLOQUEADOS):
-        return False, f"dominio bloqueado ({dominio})"
 
-    if any(b in titulo for b in TITULO_BASURA):
-        return False, "título genérico o nota/agenda"
+def score_resultado(r: dict) -> tuple[int, list[str]]:
+    texto = extraer_texto_base(r)
+    dominio = extraer_dominio(r.get("url", ""))
+    score = 0
+    razones: list[str] = []
 
-    if any(year in texto for year in ["2024", "2025"]):
-        return False, "menciona años pasados"
+    if dominio in DOMINIOS_PRIORITARIOS:
+        score += 2
+        razones.append("dominio_prioritario")
 
-    if "2026" not in texto and not any(k in texto for k in ["marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]):
-        return False, "sin señal temporal suficiente"
+    if "2026" in texto:
+        score += 3
+        razones.append("año_2026")
 
-    if contiene_keywords(texto, KEYWORDS_ESTAFA):
-        return False, "posible estafa / captación"
+    if any(mes in texto for mes in ["marzo", "abril", "mayo"]):
+        score += 2
+        razones.append("mes_objetivo")
 
-    if not contiene_keywords(texto, KEYWORDS_EXCLUSIVOS):
-        return False, "no parece evento especial/exclusivo"
+    if contiene_keywords(texto, KEYWORDS_GRATIS):
+        score += 2
+        razones.append("gratis")
 
-    if "santiago" not in texto:
-        return False, "no menciona Santiago"
+    if contiene_keywords(texto, KEYWORDS_EXCLUSIVOS):
+        score += 2
+        razones.append("tipo_evento")
 
-    if any(comuna in texto for comuna in ["providencia", "las condes", "vitacura", "ñuñoa", "nunoa", "maipú", "maipu", "la reina"]):
-        return False, "fuera de comuna de Santiago"
+    if "santiago" in texto:
+        score += 2
+        razones.append("santiago")
+
+    if any(c in texto for c in COMUNAS_PERMITIDAS):
+        score += 1
+        razones.append("comuna_foco")
 
     pub = r.get("published_date", "")
     if pub:
         try:
             fecha_pub = datetime.fromisoformat(pub.replace("Z", "+00:00")).date()
-            if fecha_pub < hoy_dt - timedelta(days=45):
-                return False, f"publicación demasiado antigua ({fecha_pub})"
+            if fecha_pub >= hoy_dt - timedelta(days=120):
+                score += 1
+                razones.append("publicacion_reciente")
         except ValueError:
             pass
 
-    return True, ""
+    return score, razones
 
 
-# ── Tavily search ────────────────────────────────────────────────────────────
+# ── Pre-filtro Python (sin IA, sin costo) ────────────────────────────────────
+def prefiltro(r: dict) -> tuple[bool, str, int, list[str]]:
+    url = r.get("url", "")
+    dominio = extraer_dominio(url)
+    titulo = normalizar(r.get("title", ""))
+    texto = extraer_texto_base(r)
+    score, razones = score_resultado(r)
+
+    if any(d in dominio for d in DOMINIOS_BLOQUEADOS):
+        return False, f"dominio bloqueado ({dominio})", score, razones
+
+    if any(b in titulo for b in TITULO_BASURA):
+        return False, "título genérico o nota/agenda", score, razones
+
+    if any(year in texto for year in ["2024", "2025"]):
+        return False, "menciona años pasados", score, razones
+
+    if contiene_keywords(texto, KEYWORDS_ESTAFA):
+        return False, "posible estafa / captación", score, razones
+
+    if any(comuna in texto for comuna in COMUNAS_EXCLUIDAS):
+        return False, "fuera de comuna de Santiago", score, razones
+
+    if "santiago" not in texto and not any(c in texto for c in COMUNAS_PERMITIDAS):
+        return False, "sin señal de Santiago", score, razones
+
+    if score < 4:
+        return False, f"score insuficiente ({score})", score, razones
+
+    return True, "", score, razones
+
+
+# ── Tavily ───────────────────────────────────────────────────────────────────
 async def tavily_search(client: httpx.AsyncClient, query: str) -> list[dict]:
     try:
         r = await client.post(
@@ -290,28 +404,60 @@ async def tavily_search(client: httpx.AsyncClient, query: str) -> list[dict]:
                 "api_key": TAVILY_API_KEY,
                 "query": query,
                 "search_depth": "advanced",
-                "max_results": 6,
+                "max_results": 7,
                 "include_answer": False,
-                "days": 30,
+                "include_raw_content": False,
+                "days": 120,
             },
-            timeout=25,
+            timeout=30,
         )
         r.raise_for_status()
         return r.json().get("results", [])
     except Exception as e:
-        print(f"[Tavily error] {query}: {e}")
+        print(f"[Tavily search error] {query}: {e}")
         return []
+
+
+async def tavily_extract(client: httpx.AsyncClient, urls: list[str]) -> dict[str, str]:
+    if not urls:
+        return {}
+
+    try:
+        r = await client.post(
+            "https://api.tavily.com/extract",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "urls": urls,
+                "extract_depth": "advanced",
+            },
+            timeout=40,
+        )
+        r.raise_for_status()
+        results = r.json().get("results", [])
+    except Exception as e:
+        print(f"[Tavily extract error] {e}")
+        return {}
+
+    extraidos: dict[str, str] = {}
+    for item in results:
+        url = item.get("url")
+        contenido = item.get("raw_content") or item.get("content") or ""
+        if url and contenido:
+            extraidos[url] = contenido[:EXTRACT_CHARS]
+    return extraidos
 
 
 # ── Groq filter ──────────────────────────────────────────────────────────────
 def groq_evaluar(resultado: dict) -> dict | None:
     groq = Groq(api_key=GROQ_API_KEY)
-    snippet = resultado.get("content", "")[:900]
+    snippet = resultado.get("content", "")[:1200]
+    raw_content = resultado.get("raw_content", "")[:EXTRACT_CHARS]
     contenido = (
         f"Título: {resultado.get('title', '')}\n"
         f"Snippet: {snippet}\n"
         f"Publicado: {resultado.get('published_date', '?')}\n"
-        f"URL: {resultado.get('url', '')}"
+        f"URL: {resultado.get('url', '')}\n"
+        f"Contenido extraído: {raw_content}"
     )
     try:
         chat = groq.chat.completions.create(
@@ -321,7 +467,7 @@ def groq_evaluar(resultado: dict) -> dict | None:
                 {"role": "user", "content": contenido},
             ],
             temperature=0.0,
-            max_tokens=320,
+            max_tokens=420,
             response_format={"type": "json_object"},
         )
         data = json.loads(chat.choices[0].message.content)
@@ -336,28 +482,26 @@ def groq_evaluar(resultado: dict) -> dict | None:
             return None
 
         fecha_evento = date.fromisoformat(fecha_iso)
-        if fecha_evento < FECHA_MINIMA:
+        if not (FECHA_MINIMA <= fecha_evento <= FECHA_MAXIMA):
             print(f"  → ❌ fecha fuera de rango ({fecha_iso})")
-            return None
-
-        if fecha_evento.year != ANO_OBJETIVO:
-            print(f"  → ❌ no corresponde a {ANO_OBJETIVO} ({fecha_iso})")
             return None
 
         if not data.get("gratis", False):
             print("  → ❌ no es gratis")
             return None
 
-        if int(data.get("exclusive_score", 0)) < 2:
-            print("  → ❌ poco exclusivo")
+        if int(data.get("exclusive_score", 0)) < 1:
+            print("  → ❌ poco especial")
             return None
 
         comuna = normalizar(data.get("comuna", ""))
         lugar = normalizar(data.get("lugar", ""))
-        if not any(c in f"{comuna} {lugar}" for c in COMUNAS_PERMITIDAS):
+        contexto = f"{comuna} {lugar}"
+        if not any(c in contexto for c in COMUNAS_PERMITIDAS):
             print(f"  → ❌ comuna fuera del foco ({data.get('comuna', '')})")
             return None
 
+        data["link"] = resultado.get("url", data.get("link", ""))
         return data
 
     except Exception as e:
@@ -365,7 +509,7 @@ def groq_evaluar(resultado: dict) -> dict | None:
         if "429" in msg:
             print("  → ⚠️ Rate limit Groq")
         else:
-            print(f"  → ⚠️ Groq error: {msg[:120]}")
+            print(f"  → ⚠️ Groq error: {msg[:140]}")
         return None
 
 
@@ -375,7 +519,8 @@ def formatear_evento(ev: dict) -> str:
     hora = ev.get("hora") or "Por confirmar"
     comuna = ev.get("comuna") or "Santiago"
     fuente = ev.get("fuente") or extraer_dominio(ev.get("link", ""))
-    motivo_exclusivo = ev.get("motivo_exclusivo") or "Edición puntual"
+    motivo_exclusivo = ev.get("motivo_exclusivo") or "Se ve como una fecha puntual con valor especial."
+    evidencia_fecha = ev.get("evidencia_fecha") or "Fecha identificada en la publicación o contenido fuente."
     return (
         f"{cat_label} — <b>{ev['nombre']}</b>\n"
         f"📍 <b>Lugar:</b> {ev['lugar']} ({comuna})\n"
@@ -383,7 +528,8 @@ def formatear_evento(ev: dict) -> str:
         f"🕒 <b>Hora:</b> {hora}\n"
         f"🎟 <b>Acceso:</b> Gratis\n"
         f"✨ <b>Qué pasa:</b> {ev['desc']}\n"
-        f"🔐 <b>Qué lo hace especial:</b> {motivo_exclusivo}\n"
+        f"🔐 <b>Por qué destaca:</b> {motivo_exclusivo}\n"
+        f"🧾 <b>Evidencia de fecha:</b> {evidencia_fecha}\n"
         f"🌐 <b>Fuente:</b> {fuente}\n"
         f"🔗 {ev['link']}"
     )
@@ -400,7 +546,7 @@ async def telegram_send(client: httpx.AsyncClient, text: str):
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
         },
-        timeout=15,
+        timeout=20,
     )
 
 
@@ -431,9 +577,10 @@ async def main():
         stats["total"] = len(todos)
         print(f"[Info] {len(todos)} resultados únicos de Tavily")
 
+        candidatos: list[dict] = []
         for r in todos:
             url = r.get("url", "")
-            titulo = r.get("title", "")[:80]
+            titulo = r.get("title", "")[:90]
 
             if url in procesadas:
                 previo = procesadas[url]
@@ -441,7 +588,7 @@ async def main():
                 stats["skip_cache"] += 1
                 continue
 
-            pasa, motivo = prefiltro(r)
+            pasa, motivo, score, razones = prefiltro(r)
             if not pasa:
                 print(f"[Pre-skip] {titulo} — {motivo}")
                 stats["skip_pre"] += 1
@@ -449,7 +596,22 @@ async def main():
                 procesadas[url] = {"estado": "prefiltro_rechazado", "detalle": motivo}
                 continue
 
-            print(f"[→ Groq] {titulo}")
+            r["prefiltro_score"] = score
+            r["prefiltro_razones"] = razones
+            candidatos.append(r)
+            print(f"[Candidato] {titulo} — score={score} razones={','.join(razones)}")
+
+        candidatos.sort(key=lambda r: r.get("prefiltro_score", 0), reverse=True)
+        candidatos = candidatos[:MAX_CANDIDATOS_GROQ]
+
+        extraidos = await tavily_extract(client, [r["url"] for r in candidatos])
+        for r in candidatos:
+            r["raw_content"] = extraidos.get(r["url"], "")
+
+        for r in candidatos:
+            url = r.get("url", "")
+            titulo = r.get("title", "")[:90]
+            print(f"[→ Groq] {titulo} — score={r.get('prefiltro_score')}")
             ev = groq_evaluar(r)
             if ev:
                 aprobados.append(ev)
@@ -478,8 +640,9 @@ async def main():
                 client,
                 (
                     f"🔎 <b>Eventos exclusivos y gratis en Santiago</b>\n"
-                    f"📅 Desde el 19 de marzo de 2026\n\n"
-                    "No encontré eventos que cumplan el filtro estricto: gratis, en Santiago y con fecha verificable de 2026."
+                    f"📅 Ventana: 19 de marzo a 31 de mayo de 2026\n\n"
+                    "No encontré resultados con evidencia suficiente de fecha y gratuidad. "
+                    "El bot descartó notas genéricas, eventos pasados, comunas fuera del foco y publicaciones sospechosas."
                 ),
             )
         else:
