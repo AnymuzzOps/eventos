@@ -3,7 +3,7 @@ import json
 import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from groq import Groq
@@ -162,6 +162,39 @@ KEYWORDS_ESTAFA = [
     "seminario de negocios",
 ]
 
+KEYWORDS_RELIGION = [
+    "dios",
+    "iglesia",
+    "cristo",
+    "jesús",
+    "jesus",
+    "evangelismo",
+    "adoración",
+    "adoracion",
+    "oración",
+    "oracion",
+    "espiritual",
+    "espiritualidad",
+    "profético",
+    "profetico",
+    "ministerio",
+    "culto",
+    "avivamiento",
+    "predica",
+]
+
+KEYWORDS_EVENTO_PAGO = [
+    "lollapalooza",
+    "festival pagado",
+    "ticket requerido",
+    "requiere entrada",
+    "requiere ticket",
+    "dentro de lollapalooza",
+    "solo para asistentes",
+    "cargadores gratis",
+    "beneficio para asistentes",
+]
+
 KEYWORDS_GRATIS = [
     "gratis",
     "gratuito",
@@ -193,6 +226,7 @@ TITULO_BASURA = [
     "free tour",
     "tour gastronómico",
     "tour gastronomico",
+    "discover",
 ]
 
 DOMINIOS_BLOQUEADOS = {
@@ -260,8 +294,12 @@ APRUEBA si se cumplen estas condiciones:
 
 RECHAZA si pasa cualquiera de estas cosas:
 - El contenido solo muestra un lugar o resume panoramas, sin evento puntual.
+- Es una página de búsqueda, discover, hashtag, perfil o query genérica, no un post/evento concreto.
+- Es una activación secundaria dentro de un festival o evento principal pagado.
+- Tiene enfoque religioso o espiritual.
 - Publicación reciente sobre un evento ya terminado.
 - Fecha 2025 o anterior, o sin evidencia mínima.
+- Si la fecha está en formato "27 de junio" sin año, debes confirmar con el contexto que sea 2026; si el contexto apunta a 2025 o es ambiguo, rechaza.
 - Es venta, ticketing, curso, feria comercial común, tour permanente o pauta evergreen.
 - Es MLM, captación, seminario para ganar dinero o posible estafa.
 - Está fuera de Santiago.
@@ -299,7 +337,6 @@ def construir_queries() -> list[str]:
             ]
         )
 
-    # Dedupe preservando orden
     return list(dict.fromkeys(base_queries))
 
 
@@ -365,6 +402,20 @@ def extraer_dominio(url: str) -> str:
         return ""
 
 
+def es_url_busqueda(url: str) -> bool:
+    parsed = urlparse(url)
+    path = normalizar(parsed.path)
+    query = parse_qs(parsed.query)
+
+    if "/discover/" in path or "/search" in path or "/explore/" in path:
+        return True
+
+    if any(key in query for key in ["q", "query", "keyword", "search"]):
+        return True
+
+    return False
+
+
 def contiene_keywords(texto: str, keywords: list[str]) -> bool:
     texto = normalizar(texto)
     return any(k in texto for k in keywords)
@@ -425,9 +476,12 @@ def score_resultado(r: dict) -> tuple[int, list[str]]:
     if pub:
         try:
             fecha_pub = datetime.fromisoformat(pub.replace("Z", "+00:00")).date()
-            if fecha_pub >= hoy_dt - timedelta(days=180):
+            if fecha_pub.year == ANO_OBJETIVO:
                 score += 1
-                razones.append("publicacion_reciente")
+                razones.append("publicacion_2026")
+            elif fecha_pub < FECHA_MINIMA - timedelta(days=180):
+                score -= 3
+                razones.append("publicacion_muy_antigua")
         except ValueError:
             pass
 
@@ -449,6 +503,9 @@ def prefiltro(r: dict) -> tuple[bool, str, int, list[str]]:
     if any(d in dominio for d in DOMINIOS_BLOQUEADOS):
         return False, f"dominio bloqueado ({dominio})", score, razones
 
+    if es_url_busqueda(url):
+        return False, "url de búsqueda/discover, no evento concreto", score, razones
+
     if any(b in titulo for b in TITULO_BASURA):
         return False, "título genérico o nota/agenda", score, razones
 
@@ -457,6 +514,12 @@ def prefiltro(r: dict) -> tuple[bool, str, int, list[str]]:
 
     if contiene_keywords(texto, KEYWORDS_ESTAFA):
         return False, "posible estafa / captación", score, razones
+
+    if contiene_keywords(texto, KEYWORDS_RELIGION):
+        return False, "contenido religioso/espiritual", score, razones
+
+    if contiene_keywords(texto, KEYWORDS_EVENTO_PAGO):
+        return False, "activación asociada a evento pagado", score, razones
 
     if any(comuna in texto for comuna in COMUNAS_EXCLUIDAS):
         return False, "fuera de comuna de Santiago", score, razones
@@ -567,6 +630,15 @@ def groq_evaluar(resultado: dict) -> dict | None:
 
         if int(data.get("exclusive_score", 0)) < 1:
             print("  → ❌ poco especial")
+            return None
+
+        texto = extraer_texto_base(resultado)
+        if contiene_keywords(texto, KEYWORDS_RELIGION):
+            print("  → ❌ religioso")
+            return None
+
+        if contiene_keywords(texto, KEYWORDS_EVENTO_PAGO):
+            print("  → ❌ activación de evento pagado")
             return None
 
         comuna = normalizar(data.get("comuna", ""))
@@ -735,7 +807,7 @@ async def main():
                     f"🔎 <b>Eventos exclusivos y gratis en Santiago</b>\n"
                     f"📅 Ventana: 19 de marzo a 30 de septiembre de 2026\n\n"
                     "No encontré resultados con evidencia suficiente de fecha y gratuidad. "
-                    "El bot descartó notas genéricas, eventos pasados, comunas fuera del foco y publicaciones sospechosas."
+                    "El bot descartó notas genéricas, búsquedas vacías, eventos pasados, religión y publicaciones sospechosas."
                 ),
             )
         else:
