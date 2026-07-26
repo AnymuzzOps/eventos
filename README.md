@@ -1,17 +1,23 @@
-# Eventos gratis en Santiago
+# Panoramas gratuitos para parejas
 
-Bot Python que busca eventos gratuitos mediante Tavily, valida candidatos con Groq y envía
-los resultados a un chat de Telegram. Se ejecuta dos veces al día mediante GitHub Actions.
+Bot en Python 3.11 que busca con Tavily panoramas gratuitos en Santiago y la Región
+Metropolitana, extrae y verifica información estructurada con Groq y envía novedades agrupadas
+a Telegram. Acepta eventos con fecha y lugares visitables cuando una fuente verificable acredita
+su disponibilidad dentro del periodo.
 
-## Requisitos
+## Qué busca y qué excluye
 
-- Python 3.11 (versión usada en CI).
-- Credenciales para Tavily, Groq y un bot/chat de Telegram.
+Busca parques, jardines, museos, exposiciones, centros culturales, ferias, conciertos, cine,
+recorridos patrimoniales, miradores, barrios, festivales, talleres para adultos y actividades
+municipales. No exige que una publicación diga “romántico”: Groq evalúa si permite caminar,
+conversar, fotografiar, hacer picnic o compartir una actividad agradable.
 
-No hay base de datos: `procesadas.txt` es un caché JSON Lines local. El workflow actual no
-persiste sus cambios entre ejecuciones.
+Solo acepta resultados con fecha vigente, comuna de la Región Metropolitana, gratuidad explícita,
+fuente directa, confianza mínima y datos suficientes. Rechaza precios ambiguos, actividades
+pagadas u online, contenido exclusivamente infantil, sorteos, publicidad, otros años y reservas
+que no estén confirmadas como gratuitas.
 
-## Configuración local
+## Requisitos e instalación
 
 ```bash
 python3.11 -m venv .venv
@@ -21,24 +27,38 @@ python -m pip install -r requirements-dev.txt
 cp .env.example .env
 ```
 
-Completa `.env` sin confirmarlo en Git y exporta sus variables con la herramienta de tu
-preferencia; el script no carga `.env` automáticamente:
+Se requieren credenciales de Tavily, Groq y Telegram. Nunca confirmes `.env` ni uses secretos de
+producción durante pruebas.
+
+## Configurar agosto de 2026
+
+```dotenv
+EVENT_START_DATE=2026-08-01
+EVENT_END_DATE=2026-08-31
+EVENT_CITY=Santiago
+EVENT_REGION=Región Metropolitana
+ONLY_FREE=true
+COUPLE_MODE=true
+MAX_EVENTS_PER_RUN=20
+DRY_RUN=true
+FORCE_RESEND=false
+```
+
+Para cambiar de mes basta con modificar `EVENT_START_DATE` y `EVENT_END_DATE`. Las fechas usan
+`YYYY-MM-DD`, se validan al iniciar y se comparan en `America/Santiago`. `MAX_EVENTS_PER_RUN`
+debe estar entre 1 y 100.
+
+## Prueba segura sin enviar a Telegram
+
+Carga las variables locales y conserva `DRY_RUN=true`:
 
 ```bash
 set -a; source .env; set +a
 python bot.py
 ```
 
-Variables obligatorias:
-
-| Variable | Uso |
-| --- | --- |
-| `TAVILY_API_KEY` | Búsqueda y extracción de fuentes web. |
-| `GROQ_API_KEY` | Validación estructurada de candidatos. |
-| `TELEGRAM_TOKEN` | Autenticación del bot de Telegram. |
-| `TELEGRAM_CHAT_ID` | Destino de los mensajes. |
-
-## Calidad y pruebas
+Este modo **sí consulta Tavily y Groq** si se ejecuta el flujo completo, pero imprime los mensajes
+y nunca contacta Telegram. La suite automatizada no llama ninguna API:
 
 ```bash
 ruff format --check .
@@ -48,23 +68,49 @@ pytest
 python -m compileall -q bot.py tests
 ```
 
-Las pruebas no llaman servicios externos. Ejecutar `python bot.py` sí consume cuotas y envía
-mensajes reales; usa credenciales y un chat de pruebas durante desarrollo.
+Para una prueba totalmente offline usa `pytest`; sus clientes y datos son simulados.
 
-## Despliegue
+## Ejecución real y manual
 
-1. Configura las cuatro variables como *Actions secrets* del repositorio.
-2. Habilita el workflow `Bot Eventos Gratis Santiago`.
-3. Ejecuta inicialmente `workflow_dispatch` con un chat de pruebas.
-4. Revisa los logs (nunca deben contener secretos) y después permite la programación cron.
+Cambia `DRY_RUN=false`, carga las cuatro credenciales y ejecuta `python bot.py`. En GitHub Actions,
+configura `TAVILY_API_KEY`, `GROQ_API_KEY`, `TELEGRAM_TOKEN` y `TELEGRAM_CHAT_ID` como *Secrets*.
+Luego abre **Actions → Panoramas gratuitos para parejas → Run workflow**. El formulario permite
+cambiar fechas, ciudad, región, máximo de resultados y reenvío de procesados.
 
-GitHub Actions instala `requirements.txt` y ejecuta `bot.py`. Las horas cron están expresadas
-en UTC; no se ajustan automáticamente al horario de verano chileno.
+El cron se ejecuta miércoles y domingo a las **13:00 UTC**, aproximadamente **09:00 en Chile
+durante el horario de invierno** (la equivalencia cambia con el horario de verano). Esta frecuencia
+busca novedades sin gastar cuota dos veces al día.
 
-## Arquitectura y límites conocidos
+## Fuentes, verificación y consumo
 
-Toda la lógica reside en `bot.py`: configuración, generación de consultas, filtros, caché,
-clientes externos, formato y orquestación. Es suficiente para el tamaño actual, pero conviene
-separar clientes y dominio antes de agregar más proveedores. Las fechas objetivo del negocio
-siguen fijadas a marzo-septiembre de 2026; deben revisarse antes de reutilizar el bot para otro
-periodo. Consulta [`AUDIT.md`](AUDIT.md) para la auditoría, decisiones y trabajo pendiente.
+Las consultas cubren municipios, Chile Cultura, Santiago Cultura, Parquemet, museos, bibliotecas,
+universidades, centros culturales, organizadores, prensa confiable y redes oficiales indexables.
+Se prioriza una URL oficial al consolidar publicaciones duplicadas.
+
+“Verificado” significa que, en la fecha indicada en el mensaje, el bot encontró una fuente directa
+y la información superó las validaciones automáticas. No garantiza que el organizador no cambie o
+cancele posteriormente; abre siempre el enlace antes de salir.
+
+Una ejecución genera actualmente 52 consultas Tavily, con hasta 6 resultados por consulta, una
+extracción por lote y como máximo 40 clasificaciones Groq. Errores de búsquedas individuales no
+cancelan todo el proceso. Ajustar comunas o consultas cambia directamente el consumo; revisa las
+cuotas de cada proveedor antes de ampliarlas.
+
+## Deduplicación e historial
+
+`procesadas.txt` almacena JSON Lines con una clave normalizada de título, fecha, lugar, comuna y
+dominio, además de una huella de campos relevantes. Un panorama solo reaparece si es nuevo, si
+cambia fecha/horario/lugar/reserva/precio/fuente, o si `FORCE_RESEND=true`. Cuando varias fuentes
+publican lo mismo se conserva la oficial.
+
+GitHub Actions restaura el historial mediante `actions/cache/restore` usando `restore-keys` y guarda
+una clave inmutable nueva por ejecución. La concurrencia única evita dos escritores simultáneos.
+Cache no es almacenamiento transaccional: para auditoría estricta o múltiples bots se recomienda
+migrar el historial a un almacén externo.
+
+## Formato de Telegram
+
+Primero se envía un resumen y después los panoramas agrupados en parques, cultura, música,
+ferias/talleres, recorridos o panoramas bajo techo. Los bloques se dividen automáticamente por
+debajo de 3.900 caracteres. Si no hay novedades, una ejecución programada guarda silencio; una
+ejecución manual informa que no encontró novedades.

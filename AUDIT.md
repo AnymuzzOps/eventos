@@ -37,9 +37,9 @@ solo nombres de variables y referencias a GitHub Secrets. `procesadas.txt` estab
 | Medio | Telegram | No se comprobaba el estado HTTP; el bot podía informar éxito tras un rechazo remoto. | Aplicar `raise_for_status`; la ejecución ahora falla de forma visible. Implementado. |
 | Medio | Zona horaria | UTC-3 fijo era incorrecto durante parte del año chileno. | Usar `America/Santiago` de `zoneinfo`. Implementado. |
 | Medio | Tests/calidad | No había tests, lint, formato ni tipado automatizado. | Añadir suite inicial y configuración; agregar workflow de PR como siguiente paso. Implementado localmente. |
-| Medio | Fechas | Ventana, consultas y textos están acoplados a 2026; el bot caducará. | Diseñar configuración de ventana con validación y tests antes del siguiente periodo. Pendiente para no alterar reglas de negocio. |
-| Medio | Disponibilidad/coste | Se lanzan todas las búsquedas concurrentemente, con riesgo de rate-limit y consumo elevado. | Añadir semáforo, reintentos acotados y presupuesto configurable tras confirmar límites del proveedor. Pendiente. |
-| Medio | Caché | GitHub Actions no persiste `procesadas.txt`, por lo que el caché no funciona entre runs. | Usar artifact/cache o almacenamiento externo con política de concurrencia y privacidad. Pendiente. |
+| Resuelto | Fechas | La ventana estaba acoplada a 2026. | Configuración y validación por entorno permiten cambiar el periodo sin editar código. |
+| Mitigado | Disponibilidad/coste | Las búsquedas se lanzaban sin límite de concurrencia. | Semáforo de cinco solicitudes y máximo de 40 candidatos; quedan pendientes reintentos acordes a las cuotas del proveedor. |
+| Mitigado | Caché | GitHub Actions no persistía `procesadas.txt`. | Cache con clave nueva, `restore-keys` y concurrencia única; almacenamiento externo sigue recomendado si se requiere garantía transaccional. |
 | Bajo | Arquitectura | Un único módulo mezcla dominio, I/O y configuración. | Extraer módulos gradualmente cuando se amplíe; hacerlo ahora produciría un diff de riesgo innecesario. |
 | Bajo | Tipos/errores | Predominan `dict` sin esquema y capturas amplias que agrupan fallos de red, parseo y contrato LLM. | Introducir `TypedDict`/modelos y excepciones específicas incrementalmente. Pendiente. |
 | Bajo | Documentación | README solo contenía el nombre del proyecto. | Documentar instalación, operación, pruebas y despliegue. Implementado. |
@@ -61,7 +61,7 @@ aplicación web, servidor o base de datos en este repositorio.
 
 ### Requiere revisión
 
-- Persistencia del caché, límites/reintentos de APIs y parametrización de fechas.
+- Persistencia transaccional del historial y límites/reintentos específicos según cuotas de APIs.
 - Contrato tipado estricto para la salida del modelo y una estrategia explícita de logs.
 
 ### Potencialmente incompatible / versiones mayores
@@ -76,5 +76,5 @@ aplicación web, servidor o base de datos en este repositorio.
 
 La suite cubre helpers críticos, pero no respuestas reales ni fallos de los tres proveedores.
 No hay lock transitivo con hashes, análisis SAST/secret scanning en CI, cobertura medida ni
-persistencia fiable. El modelo Groq y los endpoints pueden cambiar externamente; deben
+persistencia transaccional garantizada. El modelo Groq y los endpoints pueden cambiar externamente; deben
 verificarse en un chat de prueba antes del despliegue.
