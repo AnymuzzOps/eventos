@@ -53,8 +53,94 @@ CATEGORIAS = {
     "experiencia": "✨ Experiencia",
     "otro": "📌 Evento",
 }
+SPANISH_MONTHS = (
+    "enero",
+    "febrero",
+    "marzo",
+    "abril",
+    "mayo",
+    "junio",
+    "julio",
+    "agosto",
+    "septiembre",
+    "octubre",
+    "noviembre",
+    "diciembre",
+)
 
-COMUNAS_PERMITIDAS = {
+
+def parse_bool(value: str, name: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "si", "sí"}:
+        return True
+    if normalized in {"0", "false", "no"}:
+        return False
+    raise ValueError(f"{name} debe ser true o false")
+
+
+@dataclass(frozen=True)
+class Config:
+    tavily_api_key: str
+    groq_api_key: str
+    telegram_token: str
+    telegram_chat_id: str
+    start_date: date
+    end_date: date
+    city: str
+    region: str
+    only_free: bool
+    couple_mode: bool
+    max_events: int
+    dry_run: bool
+    force_resend: bool
+    manual_run: bool
+    groq_model: str = "llama-3.3-70b-versatile"
+
+    @classmethod
+    def from_env(cls, require_secrets: bool = True) -> "Config":
+        try:
+            start = date.fromisoformat(os.getenv("EVENT_START_DATE", "2026-08-01"))
+            end = date.fromisoformat(os.getenv("EVENT_END_DATE", "2026-08-31"))
+        except ValueError as error:
+            raise ValueError("EVENT_START_DATE y EVENT_END_DATE deben usar YYYY-MM-DD") from error
+        if start > end:
+            raise ValueError("EVENT_START_DATE no puede ser posterior a EVENT_END_DATE")
+        try:
+            maximum = int(os.getenv("MAX_EVENTS_PER_RUN", "20"))
+        except ValueError as error:
+            raise ValueError("MAX_EVENTS_PER_RUN debe ser un entero") from error
+        if not 1 <= maximum <= 100:
+            raise ValueError("MAX_EVENTS_PER_RUN debe estar entre 1 y 100")
+        config = cls(
+            tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
+            groq_api_key=os.getenv("GROQ_API_KEY", ""),
+            telegram_token=os.getenv("TELEGRAM_TOKEN", ""),
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+            start_date=start,
+            end_date=end,
+            city=os.getenv("EVENT_CITY", "Santiago").strip() or "Santiago",
+            region=os.getenv("EVENT_REGION", "Región Metropolitana").strip()
+            or "Región Metropolitana",
+            only_free=parse_bool(os.getenv("ONLY_FREE", "true"), "ONLY_FREE"),
+            couple_mode=parse_bool(os.getenv("COUPLE_MODE", "true"), "COUPLE_MODE"),
+            max_events=maximum,
+            dry_run=parse_bool(os.getenv("DRY_RUN", "false"), "DRY_RUN"),
+            force_resend=parse_bool(os.getenv("FORCE_RESEND", "false"), "FORCE_RESEND"),
+            manual_run=os.getenv("GITHUB_EVENT_NAME", "") == "workflow_dispatch",
+        )
+        if require_secrets and not config.dry_run:
+            required = {
+                "TAVILY_API_KEY": config.tavily_api_key,
+                "GROQ_API_KEY": config.groq_api_key,
+                "TELEGRAM_TOKEN": config.telegram_token,
+                "TELEGRAM_CHAT_ID": config.telegram_chat_id,
+            }
+            missing = [key for key, value in required.items() if not value]
+            if missing:
+                raise RuntimeError("Faltan variables de entorno requeridas: " + ", ".join(missing))
+        return config
+
+LCOMUNAS_PERMITIDAS = {
     "santiago",
     "santiago centro",
     "centro de santiago",
@@ -536,10 +622,157 @@ def prefiltro(r: dict) -> tuple[bool, str, int, list[str]]:
 # ── Tavily ───────────────────────────────────────────────────────────────────
 async def tavily_search(client: httpx.AsyncClient, query: str) -> list[dict]:
     try:
-        r = await client.post(
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_panorama(item: dict, config: Config, today: date | None = None) -> tuple[bool, str]:
+    today = today or datetime.now(CHILE_TZ).date()
+    start = parse_event_date(item.get("fecha_inicio"))
+    end = parse_event_date(item.get("fecha_fin")) or start
+    if not start or not end:
+        return False, "fecha no comprobable"
+    if end < config.start_date or start > config.end_date or end < today:
+        return False, "fecha fuera del periodo o vencida"
+    if start.year != config.start_date.year or end.year != config.end_date.year:
+        return False, "información correspondiente a otro año"
+    if item.get("es_gratis") is not True:
+        return False, "gratuidad no confirmada"
+    price = normalize(item.get("precio_texto"))
+    if any(word in price for word in BLOCKED_PRICE_WORDS) or not any(
+        word in price for word in ("gratis", "gratuito", "entrada liberada", "sin costo")
+    ):
+        return False, "precio no informado claramente como gratuito"
+    if item.get("requiere_reserva") and item.get("reserva_gratuita") is not True:
+        return False, "reserva no confirmada como gratuita"
+    if not is_rm_comuna(item.get("comuna")):
+        return False, "comuna fuera de la Región Metropolitana"
+    source_url = str(item.get("url_fuente") or "")
+    if not source_url.startswith(("https://", "http://")) or is_search_url(source_url):
+        return False, "fuente directa no verificable"
+    if int(item.get("confianza") or 0) < MIN_CONFIDENCE:
+        return False, "confianza baja"
+    if config.couple_mode and item.get("apto_para_pareja") is not True:
+        return False, "no apto para una salida en pareja"
+    return True, ""
+
+
+def dedupe_key(item: dict) -> str:
+    fields = (
+        item.get("titulo"),
+        item.get("fecha_inicio"),
+        item.get("direccion"),
+        item.get("comuna"),
+        domain(str(item.get("url_fuente") or "")),
+    )
+    return "|".join(normalize(field) for field in fields)
+
+
+def content_fingerprint(item: dict) -> str:
+    relevant = {
+        key: item.get(key)
+        for key in (
+            "titulo",
+            "fecha_inicio",
+            "fecha_fin",
+            "horario",
+            "comuna",
+            "direccion",
+            "requiere_reserva",
+            "url_reserva",
+            "url_fuente",
+            "precio_texto",
+        )
+    }
+    return hashlib.sha256(
+        json.dumps(relevant, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+def prefer_official(items: list[dict]) -> list[dict]:
+    chosen: dict[str, dict] = {}
+    for item in items:
+        key = "|".join(normalize(item.get(field)) for field in ("titulo", "fecha_inicio", "comuna"))
+        current = chosen.get(key)
+        if current is None or (
+            is_official_source(str(item.get("url_fuente", "")), str(item.get("fuente", "")))
+            and not is_official_source(
+                str(current.get("url_fuente", "")), str(current.get("fuente", ""))
+            )
+        ):
+            chosen[key] = item
+    return list(chosen.values())
+
+
+def build_queries(config: Config) -> list[str]:
+    month = config.start_date.strftime("%m/%Y")
+    month_name = SPANISH_MONTHS[config.start_date.month - 1]
+    month_year = f"{month_name} {config.start_date.year}"
+    period = f"{config.start_date.isoformat()} {config.end_date.isoformat()}"
+    base = [
+        f"eventos gratis {config.city} {month_year}",
+        f"panoramas gratuitos {config.city} {month_year}",
+        f"actividades gratuitas {config.region} {month_year}",
+        "jardines gratuitos Santiago",
+        "parques para visitar en pareja Santiago",
+        "museos gratis Santiago",
+        f"exposiciones gratuitas {config.city} {month_year}",
+        f"conciertos gratis {config.city} {month_year}",
+        f"actividades municipales {month_year} {config.region}",
+        f"entrada liberada {config.city} {month_year}",
+        f"recorridos patrimoniales gratis {config.region} {month}",
+        f"cine al aire libre gratis {config.region} {period}",
+        f"site:chilecultura.gob.cl gratis {config.region} {month_year}",
+        f"site:santiagocultura.cl gratis {month_year}",
+        f"site:parquemet.cl actividades gratis {period}",
+        f"museos bibliotecas centros culturales entrada liberada {config.region} {period}",
+    ]
+    for comuna in COMUNAS_BUSQUEDA:
+        base.append(f"site:*.cl actividades gratis {comuna} {month_year} municipalidad cultura")
+        base.append(f"panoramas gratis {comuna} {month_year} fuente oficial")
+    return list(dict.fromkeys(base))
+
+
+def system_prompt(config: Config) -> str:
+    return f"""Eres un extractor estricto de panoramas gratuitos para adultos en pareja.
+Periodo permitido: {config.start_date.isoformat()} a {config.end_date.isoformat()} en America/Santiago.
+Ubicación: {config.city}, {config.region}, Chile. No inventes ni completes datos sin respaldo.
+Rechaza pagos, precio ambiguo, online, exclusivamente infantil, sorteos, publicidad, otra región/año,
+fuentes sin fecha y reservas no confirmadas como gratuitas. Para lugares permanentes exige evidencia
+de disponibilidad dentro del periodo. Prioriza fuente oficial. Responde SOLO un objeto JSON con:
+{{"titulo":"","categoria":"","descripcion":"","fecha_inicio":"YYYY-MM-DD","fecha_fin":"YYYY-MM-DD",
+"horario":"","comuna":"","direccion":"","es_gratis":true,"precio_texto":"",
+"requiere_reserva":false,"reserva_gratuita":false,"url_reserva":"","fuente":"","url_fuente":"",
+"interior_exterior":"interior|exterior|mixta|no informado","recomendacion_lluvia":"",
+"apto_para_pareja":true,"razon_para_pareja":"","confianza":0}}.
+Usa "No informado" solo en campos no esenciales. URL, comuna, fecha y gratuidad son esenciales."""
+
+
+def prefilter(result: dict) -> bool:
+    text = normalize(" ".join(str(result.get(k, "")) for k in ("title", "content", "raw_content")))
+    url = str(result.get("url", ""))
+    if not url.startswith(("http://", "https://")) or is_search_url(url):
+        return False
+    negatives = (
+        "evento online",
+        "solo online",
+        "sorteo",
+        "concurso",
+        "entrada desde",
+        "tickets desde",
+    )
+    return not any(word in text for word in negatives)
+
+
+async def tavily_search(
+    client: httpx.AsyncClient, query: str, config: Config, semaphore: asyncio.Semaphore
+) -> list[dict]:
+    async with semaphore:
+        response = await client.post(
             "https://api.tavily.com/search",
             json={
-                "api_key": TAVILY_API_KEY,
+                "api_key": config.tavily_api_key,
                 "query": query,
                 "search_depth": "advanced",
                 "max_results": 8,
@@ -711,6 +944,9 @@ async def main():
         "aprobados": 0,
     }
 
+async def run(config: Config) -> list[str]:
+    queries = build_queries(config)
+    semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
     async with httpx.AsyncClient() as client:
         resultados_por_query = await asyncio.gather(*(tavily_search(client, q) for q in QUERIES))
 
