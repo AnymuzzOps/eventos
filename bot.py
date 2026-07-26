@@ -1,130 +1,57 @@
 import asyncio
-import hashlib
-import html
 import json
 import os
-import unicodedata
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-from zoneinfo import ZoneInfo
 
 import httpx
 from groq import Groq
 
-CHILE_TZ = ZoneInfo("America/Santiago")
-PROCESADAS_PATH = Path("procesadas.txt")
-TELEGRAM_MAX_CHARS = 3900
-CACHE_TTL_APROBADO_DIAS = 1
-CACHE_TTL_RECHAZADO_DIAS = 7
-MIN_CONFIDENCE = 70
-MAX_CANDIDATES = 40
-SEARCH_CONCURRENCY = 5
-EXTRACT_CHARS = 5000
+# ── Config ──────────────────────────────────────────────────────────────────
+TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-COMUNAS_RM = {
-    "alhue",
-    "buin",
-    "calera de tango",
-    "cerrillos",
-    "cerro navia",
-    "colina",
-    "conchali",
-    "curacavi",
-    "el bosque",
-    "el monte",
-    "estacion central",
-    "huechuraba",
-    "independencia",
-    "isla de maipo",
-    "la cisterna",
-    "la florida",
-    "la granja",
-    "la pintana",
-    "la reina",
-    "lampa",
-    "las condes",
-    "lo barnechea",
-    "lo espejo",
-    "lo prado",
-    "macul",
-    "maipu",
-    "maria pinto",
-    "melipilla",
-    "nunoa",
-    "padre hurtado",
-    "paine",
-    "pedro aguirre cerda",
-    "penaflor",
-    "penalolen",
-    "pirque",
-    "providencia",
-    "pudahuel",
-    "puente alto",
-    "quilicura",
-    "quinta normal",
-    "recoleta",
-    "renca",
-    "san bernardo",
-    "san joaquin",
-    "san jose de maipo",
-    "san miguel",
-    "san pedro",
-    "san ramon",
-    "santiago",
-    "talagante",
-    "tiltil",
-    "vitacura",
-}
-COMUNAS_BUSQUEDA = [
-    "Santiago",
-    "Providencia",
-    "Ñuñoa",
-    "Las Condes",
-    "Vitacura",
-    "La Reina",
-    "Peñalolén",
-    "San Miguel",
-    "Estación Central",
-    "Quinta Normal",
-    "Maipú",
-    "Puente Alto",
-    "La Florida",
-    "Recoleta",
-    "Independencia",
-    "San José de Maipo",
-    "Buin",
-    "Melipilla",
+GROQ_MODEL = "llama-3.3-70b-versatile"
+PROCESADAS_PATH = Path("procesadas.txt")
+MAX_EVENTOS = 12
+MAX_CANDIDATOS_GROQ = 32
+EXTRACT_CHARS = 5000
+CACHE_TTL_APROBADO_DIAS = 90
+CACHE_TTL_RECHAZADO_DIAS = 10
+
+CHILE_TZ = timezone(timedelta(hours=-3))
+ahora = datetime.now(CHILE_TZ)
+hoy_dt = ahora.date()
+hoy = ahora.strftime("%-d de %B de %Y")
+hoy_iso = hoy_dt.isoformat()
+ANO_OBJETIVO = 2026
+FECHA_MINIMA = date(2026, 3, 19)
+FECHA_MAXIMA = date(2026, 9, 30)
+MESES_BUSQUEDA = [
+    "marzo 2026",
+    "abril 2026",
+    "mayo 2026",
+    "junio 2026",
+    "julio 2026",
+    "agosto 2026",
+    "septiembre 2026",
 ]
-OFFICIAL_DOMAINS = (
-    ".gob.cl",
-    ".muni.cl",
-    ".cl/cultura",
-    "municipalidad",
-    "museo",
-    "biblioteca",
-    "cultur",
-    "uchile.cl",
-    "uc.cl",
-    "usach.cl",
-    "parquemet.cl",
-)
-BLOCKED_PRICE_WORDS = ("desde $", "entrada desde", "ticket desde", "valor desde")
-CATEGORIES = {
-    "parque": "🌿 Parques y jardines",
-    "jardin": "🌿 Parques y jardines",
-    "naturaleza": "🌿 Parques y jardines",
-    "museo": "🏛️ Museos y cultura",
-    "cultura": "🏛️ Museos y cultura",
-    "musica": "🎶 Música y espectáculos",
-    "espectaculo": "🎶 Música y espectáculos",
-    "feria": "🎨 Ferias, talleres y exposiciones",
-    "taller": "🎨 Ferias, talleres y exposiciones",
-    "exposicion": "🎨 Ferias, talleres y exposiciones",
-    "recorrido": "🚶 Recorridos y panoramas urbanos",
-    "urbano": "🚶 Recorridos y panoramas urbanos",
-    "interior": "🌧️ Panoramas bajo techo",
+
+
+# ── Diccionarios ─────────────────────────────────────────────────────────────
+CATEGORIAS = {
+    "degustacion": "🍷 Degustación",
+    "inauguracion": "🎊 Inauguración",
+    "popup": "🛍 Pop-up",
+    "activacion": "📣 Activación",
+    "arte": "🎨 Arte/Cultura",
+    "feria": "🏪 Feria",
+    "musica": "🎵 Música",
+    "experiencia": "✨ Experiencia",
+    "otro": "📌 Evento",
 }
 SPANISH_MONTHS = (
     "enero",
@@ -213,33 +140,487 @@ class Config:
                 raise RuntimeError("Faltan variables de entorno requeridas: " + ", ".join(missing))
         return config
 
+LCOMUNAS_PERMITIDAS = {
+    "santiago",
+    "santiago centro",
+    "centro de santiago",
+    "casco histórico",
+    "casco historico",
+    "lastarria",
+    "bellas artes",
+    "barrio yungay",
+    "parque o'higgins",
+    "parque ohiggins",
+    "quinta normal",
+    "mapocho",
+    "plaza de armas",
+    "gam",
+    "baquedano",
+    "alameda",
+    "matucana",
+    "recoleta",
+    "patronato",
+    "estación central",
+    "estacion central",
+    "mercado central",
+    "san diego",
+    "club hípico",
+    "club hipico",
+}
 
-def normalize(value: object) -> str:
-    text = unicodedata.normalize("NFKD", str(value or ""))
-    return " ".join("".join(c for c in text if not unicodedata.combining(c)).lower().split())
+COMUNAS_EXCLUIDAS = [
+    "providencia",
+    "las condes",
+    "vitacura",
+    "ñuñoa",
+    "nunoa",
+    "maipú",
+    "maipu",
+    "la reina",
+    "peñalolén",
+    "penalolen",
+    "lo barnechea",
+    "pudahuel",
+    "huechuraba",
+    "quilicura",
+    "san miguel",
+]
+
+TIPOS_EVENTO = [
+    "inauguración",
+    "degustación",
+    "activación",
+    "lanzamiento",
+    "pop up",
+    "apertura",
+    "experiencia",
+    "feria gastronómica",
+    "festival gratis",
+    "música en vivo gratis",
+]
+
+KEYWORDS_EXCLUSIVOS = [
+    "inaugur",
+    "opening",
+    "apertura",
+    "lanzamiento",
+    "premiere",
+    "preestreno",
+    "experiencia",
+    "activación",
+    "activacion",
+    "degust",
+    "cata",
+    "wine tasting",
+    "edición limitada",
+    "edicion limitada",
+    "solo por",
+    "cupos limitados",
+    "única fecha",
+    "unica fecha",
+    "pop-up",
+    "popup",
+    "intervención",
+    "intervencion",
+    "showroom",
+    "guest",
+    "market temporal",
+]
+
+KEYWORDS_ESTAFA = [
+    "multinivel",
+    "network marketing",
+    "ganancias",
+    "gana dinero",
+    "independencia financiera",
+    "corea",
+    "emprendimiento coreano",
+    "kit inicial",
+    "inscripción",
+    "inscripcion",
+    "reserva con pago",
+    "abono",
+    "pirámide",
+    "piramide",
+    "mentor financiero",
+    "inversión garantizada",
+    "inversion garantizada",
+    "seminario de negocios",
+]
+
+KEYWORDS_RELIGION = [
+    "dios",
+    "iglesia",
+    "cristo",
+    "jesús",
+    "jesus",
+    "evangelismo",
+    "adoración",
+    "adoracion",
+    "oración",
+    "oracion",
+    "espiritual",
+    "espiritualidad",
+    "profético",
+    "profetico",
+    "ministerio",
+    "culto",
+    "avivamiento",
+    "predica",
+]
+
+KEYWORDS_EVENTO_PAGO = [
+    "lollapalooza",
+    "festival pagado",
+    "ticket requerido",
+    "requiere entrada",
+    "requiere ticket",
+    "dentro de lollapalooza",
+    "solo para asistentes",
+    "cargadores gratis",
+    "beneficio para asistentes",
+]
+
+KEYWORDS_GRATIS = [
+    "gratis",
+    "gratuito",
+    "gratuita",
+    "entrada liberada",
+    "entrada libre",
+    "sin costo",
+    "free",
+    "free entry",
+    "liberado",
+]
+
+TITULO_BASURA = [
+    "10 panoramas",
+    "10 cosas",
+    "diez panoramas",
+    "5 imperdibles",
+    "los mejores panoramas",
+    "qué hacer en santiago",
+    "que hacer en santiago",
+    "agenda cultural",
+    "cartelera",
+    "panoramas del fin de semana",
+    "home -",
+    "guía de",
+    "guia de",
+    "funcionamiento de",
+    "municipalidad de",
+    "free tour",
+    "tour gastronómico",
+    "tour gastronomico",
+    "discover",
+]
+
+DOMINIOS_BLOQUEADOS = {
+    "eventbrite.com",
+    "eventbrite.cl",
+    "ticketplus.cl",
+    "puntoticket.com",
+    "freetour.com",
+    "emprende.cl",
+    "facebook.com",
+}
+
+DOMINIOS_PRIORITARIOS = {
+    "instagram.com",
+    "tiktok.com",
+    "santiagocultura.cl",
+    "chilecultura.gob.cl",
+    "santiagoturismo.cl",
+    "biobiochile.cl",
+    "publimetro.cl",
+    "theclinic.cl",
+    "df.cl",
+    "latercera.com",
+    "lacuarta.com",
+    "adnradio.cl",
+    "chvnoticias.cl",
+}
 
 
-def domain(url: str) -> str:
-    return urlparse(url).netloc.lower().removeprefix("www.")
+# ── Prompt ──────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = f"""Eres un verificador de eventos presenciales gratis.
+
+Fecha actual de referencia: {hoy_iso}.
+Debes encontrar eventos en Santiago de Chile posteriores al 2026-03-18.
+El objetivo es detectar eventos reales y atractivos como inauguraciones, degustaciones gratis, activaciones, lanzamientos, pop-ups temporales, festivales puntuales o experiencias especiales.
+
+Responde SOLO JSON.
+Si apruebas:
+{{
+  "ok": true,
+  "nombre": "...",
+  "lugar": "...",
+  "comuna": "...",
+  "fecha": "texto legible",
+  "fecha_iso": "YYYY-MM-DD",
+  "hora": "HH:MM o null",
+  "desc": "resumen claro del evento",
+  "cat": "degustacion|inauguracion|popup|activacion|arte|feria|musica|experiencia|otro",
+  "gratis": true,
+  "exclusive_score": 0-5,
+  "motivo_exclusivo": "por qué se siente especial o distinto",
+  "evidencia_fecha": "qué texto o dato respalda la fecha",
+  "fuente": "instagram|tiktok|web",
+  "link": "..."
+}}
+Si rechazas:
+{{"ok": false, "r": "motivo breve"}}
+
+APRUEBA si se cumplen estas condiciones:
+- Es un evento presencial en Santiago de Chile.
+- La fecha del evento es verificable y ocurre entre 2026-03-19 y 2026-09-30.
+- Se ve gratis o entrada liberada.
+- Hay suficiente evidencia en título, snippet o contenido extraído.
+- Puede ser especial por formato, marca, apertura, experiencia puntual, festival o cupos limitados. No hace falta que use la palabra "exclusivo" literal.
+
+RECHAZA si pasa cualquiera de estas cosas:
+- El contenido solo muestra un lugar o resume panoramas, sin evento puntual.
+- Es una página de búsqueda, discover, hashtag, perfil o query genérica, no un post/evento concreto.
+- Es una activación secundaria dentro de un festival o evento principal pagado.
+- Tiene enfoque religioso o espiritual.
+- Publicación reciente sobre un evento ya terminado.
+- Fecha 2025 o anterior, o sin evidencia mínima.
+- Si la fecha está en formato "27 de junio" sin año, debes confirmar con el contexto que sea 2026; si el contexto apunta a 2025 o es ambiguo, rechaza.
+- Es venta, ticketing, curso, feria comercial común, tour permanente o pauta evergreen.
+- Es MLM, captación, seminario para ganar dinero o posible estafa.
+- Está fuera de Santiago.
+
+Si la evidencia es parcial pero razonable, aprueba solo si la fecha y gratuidad están respaldadas por el contenido.
+"""
 
 
-def is_search_url(url: str) -> bool:
+# ── Queries ─────────────────────────────────────────────────────────────────
+def construir_queries() -> list[str]:
+    base_queries = [
+        f"eventos gratis Santiago Chile {ANO_OBJETIVO}",
+        f"eventos gratis santiago centro {ANO_OBJETIVO}",
+        f"eventos con entrada liberada Santiago {ANO_OBJETIVO}",
+        f"site:santiagocultura.cl Santiago gratis {ANO_OBJETIVO}",
+        f"site:chilecultura.gob.cl Santiago gratis {ANO_OBJETIVO}",
+        f"site:santiagoturismo.cl Santiago evento gratis {ANO_OBJETIVO}",
+    ]
+
+    for mes in MESES_BUSQUEDA:
+        for tipo in TIPOS_EVENTO:
+            base_queries.append(f"{tipo} gratis Santiago Chile {mes}")
+            base_queries.append(f"{tipo} Santiago centro gratis {mes}")
+
+        base_queries.extend(
+            [
+                f"site:instagram.com/p/ inauguración Santiago gratis {mes}",
+                f"site:instagram.com/p/ degustación Santiago gratis {mes}",
+                f"site:instagram.com/p/ pop up Santiago centro {mes}",
+                f"site:instagram.com/p/ activación Santiago {mes}",
+                f"site:tiktok.com Santiago gratis inauguración {mes}",
+                f"site:biobiochile.cl Santiago gratis {mes}",
+                f"site:latercera.com Santiago gratis {mes}",
+                f"site:publimetro.cl Santiago evento gratis {mes}",
+            ]
+        )
+
+    return list(dict.fromkeys(base_queries))
+
+
+QUERIES = construir_queries()
+
+
+# ── Cache de procesadas ─────────────────────────────────────────────────────
+def cargar_procesadas() -> dict[str, dict]:
+    cache: dict[str, dict] = {}
+    if not PROCESADAS_PATH.exists():
+        return cache
+
+    for line in PROCESADAS_PATH.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        url = data.get("url")
+        if url:
+            cache[url] = data
+    return cache
+
+
+def guardar_procesada(url: str, estado: str, detalle: str, fecha_iso: str | None = None):
+    entry = {
+        "url": url,
+        "estado": estado,
+        "detalle": detalle,
+        "fecha_iso": fecha_iso,
+        "procesado_en": datetime.now(timezone.utc).isoformat(),
+    }
+    with PROCESADAS_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def deberia_omitir_por_cache(entry: dict) -> bool:
+    procesado_en = entry.get("procesado_en")
+    estado = entry.get("estado", "")
+    if not procesado_en:
+        return False
+
+    try:
+        fecha_cache = datetime.fromisoformat(procesado_en.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+
+    edad = datetime.now(timezone.utc) - fecha_cache
+    ttl_dias = CACHE_TTL_APROBADO_DIAS if estado == "aprobado" else CACHE_TTL_RECHAZADO_DIAS
+    return edad <= timedelta(days=ttl_dias)
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+def normalizar(texto: str) -> str:
+    return (texto or "").strip().lower()
+
+
+def extraer_dominio(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower().removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def es_url_busqueda(url: str) -> bool:
     parsed = urlparse(url)
-    return any(part in parsed.path.lower() for part in ("/search", "/discover", "/explore")) or any(
-        key in parse_qs(parsed.query) for key in ("q", "query", "search", "keyword")
-    )
+    path = normalizar(parsed.path)
+    query = parse_qs(parsed.query)
+
+    if "/discover/" in path or "/search" in path or "/explore/" in path:
+        return True
+
+    if any(key in query for key in ["q", "query", "keyword", "search"]):
+        return True
+
+    return False
 
 
-def is_official_source(url: str, source: str = "") -> bool:
-    value = f"{domain(url)} {normalize(source)}"
-    return any(marker in value for marker in OFFICIAL_DOMAINS)
+def contiene_keywords(texto: str, keywords: list[str]) -> bool:
+    texto = normalizar(texto)
+    return any(k in texto for k in keywords)
 
 
-def is_rm_comuna(comuna: object) -> bool:
-    return normalize(comuna) in COMUNAS_RM
+def extraer_texto_base(r: dict) -> str:
+    return " ".join(
+        [
+            normalizar(r.get("title", "")),
+            normalizar(r.get("content", "")),
+            normalizar(r.get("raw_content", "")),
+        ]
+    ).strip()
 
 
-def parse_event_date(value: object) -> date | None:
+def dedupe_key_evento(ev: dict) -> str:
+    nombre = normalizar(ev.get("nombre", ""))
+    fecha_iso = ev.get("fecha_iso", "")
+    lugar = normalizar(ev.get("lugar", ""))
+    return f"{nombre}|{fecha_iso}|{lugar}"
+
+
+def score_resultado(r: dict) -> tuple[int, list[str]]:
+    texto = extraer_texto_base(r)
+    dominio = extraer_dominio(r.get("url", ""))
+    score = 0
+    razones: list[str] = []
+
+    if dominio in DOMINIOS_PRIORITARIOS:
+        score += 2
+        razones.append("dominio_prioritario")
+
+    if "2026" in texto:
+        score += 3
+        razones.append("año_2026")
+
+    if any(mes in texto for mes in ["marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre"]):
+        score += 2
+        razones.append("mes_objetivo")
+
+    if contiene_keywords(texto, KEYWORDS_GRATIS):
+        score += 2
+        razones.append("gratis")
+
+    if contiene_keywords(texto, KEYWORDS_EXCLUSIVOS):
+        score += 2
+        razones.append("tipo_evento")
+
+    if "santiago" in texto:
+        score += 2
+        razones.append("santiago")
+
+    if any(c in texto for c in COMUNAS_PERMITIDAS):
+        score += 2
+        razones.append("comuna_foco")
+
+    pub = r.get("published_date", "")
+    if pub:
+        try:
+            fecha_pub = datetime.fromisoformat(pub.replace("Z", "+00:00")).date()
+            if fecha_pub.year == ANO_OBJETIVO:
+                score += 1
+                razones.append("publicacion_2026")
+            elif fecha_pub < FECHA_MINIMA - timedelta(days=180):
+                score -= 3
+                razones.append("publicacion_muy_antigua")
+        except ValueError:
+            pass
+
+    if "instagram.com" in dominio or "tiktok.com" in dominio:
+        score += 1
+        razones.append("social_source")
+
+    return score, razones
+
+
+# ── Pre-filtro Python (sin IA, sin costo) ────────────────────────────────────
+def prefiltro(r: dict) -> tuple[bool, str, int, list[str]]:
+    url = r.get("url", "")
+    dominio = extraer_dominio(url)
+    titulo = normalizar(r.get("title", ""))
+    texto = extraer_texto_base(r)
+    score, razones = score_resultado(r)
+
+    if any(d in dominio for d in DOMINIOS_BLOQUEADOS):
+        return False, f"dominio bloqueado ({dominio})", score, razones
+
+    if es_url_busqueda(url):
+        return False, "url de búsqueda/discover, no evento concreto", score, razones
+
+    if any(b in titulo for b in TITULO_BASURA):
+        return False, "título genérico o nota/agenda", score, razones
+
+    if any(year in texto for year in ["2024", "2025"]):
+        return False, "menciona años pasados", score, razones
+
+    if contiene_keywords(texto, KEYWORDS_ESTAFA):
+        return False, "posible estafa / captación", score, razones
+
+    if contiene_keywords(texto, KEYWORDS_RELIGION):
+        return False, "contenido religioso/espiritual", score, razones
+
+    if contiene_keywords(texto, KEYWORDS_EVENTO_PAGO):
+        return False, "activación asociada a evento pagado", score, razones
+
+    if any(comuna in texto for comuna in COMUNAS_EXCLUIDAS):
+        return False, "fuera de comuna de Santiago", score, razones
+
+    if "santiago" not in texto and not any(c in texto for c in COMUNAS_PERMITIDAS):
+        return False, "sin señal de Santiago", score, razones
+
+    if score < 3:
+        return False, f"score insuficiente ({score})", score, razones
+
+    return True, "", score, razones
+
+
+# ── Tavily ───────────────────────────────────────────────────────────────────
+async def tavily_search(client: httpx.AsyncClient, query: str) -> list[dict]:
     try:
         return date.fromisoformat(str(value)[:10])
     except (TypeError, ValueError):
@@ -394,248 +775,290 @@ async def tavily_search(
                 "api_key": config.tavily_api_key,
                 "query": query,
                 "search_depth": "advanced",
-                "max_results": 6,
+                "max_results": 8,
                 "include_answer": False,
                 "include_raw_content": False,
+                "days": 210,
             },
             timeout=35,
         )
-        response.raise_for_status()
-        return response.json().get("results", [])
+        r.raise_for_status()
+        return r.json().get("results", [])
+    except Exception as e:
+        print(f"[Tavily search error] {query}: {e}")
+        return []
 
 
-async def tavily_extract(
-    client: httpx.AsyncClient, urls: list[str], config: Config
-) -> dict[str, str]:
+async def tavily_extract(client: httpx.AsyncClient, urls: list[str]) -> dict[str, str]:
     if not urls:
         return {}
-    response = await client.post(
-        "https://api.tavily.com/extract",
-        json={
-            "api_key": config.tavily_api_key,
-            "urls": urls,
-            "extract_depth": "advanced",
-        },
-        timeout=45,
-    )
-    response.raise_for_status()
-    return {
-        item["url"]: (item.get("raw_content") or item.get("content") or "")[:EXTRACT_CHARS]
-        for item in response.json().get("results", [])
-        if item.get("url")
-    }
 
-
-def groq_evaluate(result: dict, config: Config) -> dict | None:
-    content = "\n".join(
-        f"{key}: {result.get(key, '')}"
-        for key in ("title", "content", "published_date", "url", "raw_content")
-    )[: EXTRACT_CHARS + 2500]
-    response = Groq(api_key=config.groq_api_key).chat.completions.create(
-        model=config.groq_model,
-        messages=[
-            {"role": "system", "content": system_prompt(config)},
-            {"role": "user", "content": content},
-        ],
-        temperature=0.0,
-        max_tokens=700,
-        response_format={"type": "json_object"},
-    )
-    item = json.loads(response.choices[0].message.content)
-    item["url_fuente"] = result.get("url", "")
-    return item
-
-
-def category_label(item: dict) -> str:
-    category = normalize(item.get("categoria"))
-    interior = normalize(item.get("interior_exterior"))
-    if interior == "interior":
-        return CATEGORIES["interior"]
-    return next(
-        (label for key, label in CATEGORIES.items() if key in category),
-        "🚶 Recorridos y panoramas urbanos",
-    )
-
-
-def safe(value: object, fallback: str = "No informado") -> str:
-    return html.escape(str(value or fallback), quote=False)
-
-
-def format_panorama(item: dict, verified_at: date) -> str:
-    reservation = "Requiere reserva gratuita" if item.get("requiere_reserva") else "Sin reserva"
-    reservation_url = (
-        f"\n🔗 <b>Inscripción:</b> {safe(item.get('url_reserva'))}"
-        if item.get("url_reserva")
-        else ""
-    )
-    rain = (
-        f"\n☔ <b>Si llueve:</b> {safe(item.get('recomendacion_lluvia'))}"
-        if item.get("recomendacion_lluvia")
-        else ""
-    )
-    return (
-        f"<b>{safe(item.get('titulo'))}</b>\n"
-        f"📅 <b>Fecha:</b> {safe(item.get('fecha_inicio'))} a {safe(item.get('fecha_fin') or item.get('fecha_inicio'))}\n"
-        f"🕒 <b>Horario:</b> {safe(item.get('horario'))}\n"
-        f"📍 <b>{safe(item.get('comuna'))}</b> — {safe(item.get('direccion'))}\n"
-        f"💰 <b>Gratis</b>\n🎟️ {safe(reservation)}{reservation_url}\n"
-        f"🌦️ <b>Tipo:</b> {safe(item.get('interior_exterior'))}{rain}\n\n"
-        f"{safe(item.get('descripcion'))}\n\n💑 {safe(item.get('razon_para_pareja'))}\n"
-        f"🔗 <b>Fuente:</b> {safe(item.get('fuente'))} — {safe(item.get('url_fuente'))}\n"
-        f"✅ <b>Verificado:</b> {verified_at.isoformat()}"
-    )
-
-
-def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    current = ""
-    for block in text.split("\n\n"):
-        candidate = f"{current}\n\n{block}" if current else block
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        while len(block) > limit:
-            cut = block.rfind("\n", 0, limit)
-            cut = cut if cut > 0 else limit
-            chunks.append(block[:cut])
-            block = block[cut:].lstrip("\n")
-        current = block
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def grouped_messages(items: list[dict], verified_at: date) -> list[str]:
-    groups: dict[str, list[str]] = {}
-    for item in items:
-        groups.setdefault(category_label(item), []).append(format_panorama(item, verified_at))
-    messages = []
-    for label, entries in groups.items():
-        messages.extend(split_message(f"<b>{label}</b>\n\n" + "\n\n".join(entries)))
-    return messages
-
-
-def load_history(path: Path = PROCESADAS_PATH) -> dict[str, dict]:
-    history: dict[str, dict] = {}
-    if not path.exists():
-        return history
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            entry = json.loads(line)
-            history[entry.get("key") or entry.get("url", "")] = entry
-        except (json.JSONDecodeError, AttributeError):
-            continue
-    return history
-
-
-def history_is_fresh(entry: dict, ttl_days: int) -> bool:
     try:
-        processed = datetime.fromisoformat(str(entry["processed_at"]).replace("Z", "+00:00"))
-        if processed.tzinfo is None:
-            processed = processed.replace(tzinfo=UTC)
-        return datetime.now(UTC) - processed <= timedelta(days=ttl_days)
-    except (KeyError, TypeError, ValueError):
-        return False
+        r = await client.post(
+            "https://api.tavily.com/extract",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "urls": urls,
+                "extract_depth": "advanced",
+            },
+            timeout=45,
+        )
+        r.raise_for_status()
+        results = r.json().get("results", [])
+    except Exception as e:
+        print(f"[Tavily extract error] {e}")
+        return {}
+
+    extraidos: dict[str, str] = {}
+    for item in results:
+        url = item.get("url")
+        contenido = item.get("raw_content") or item.get("content") or ""
+        if url and contenido:
+            extraidos[url] = contenido[:EXTRACT_CHARS]
+    return extraidos
 
 
-def save_history(item: dict, path: Path = PROCESADAS_PATH) -> None:
-    entry = {
-        "key": dedupe_key(item),
-        "url": item.get("url_fuente"),
-        "fingerprint": content_fingerprint(item),
-        "processed_at": datetime.now(UTC).isoformat(),
-    }
-    with path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+# ── Groq filter ──────────────────────────────────────────────────────────────
+def groq_evaluar(resultado: dict) -> dict | None:
+    groq = Groq(api_key=GROQ_API_KEY)
+    snippet = resultado.get("content", "")[:1500]
+    raw_content = resultado.get("raw_content", "")[:EXTRACT_CHARS]
+    contenido = (
+        f"Título: {resultado.get('title', '')}\n"
+        f"Snippet: {snippet}\n"
+        f"Publicado: {resultado.get('published_date', '?')}\n"
+        f"URL: {resultado.get('url', '')}\n"
+        f"Contenido extraído: {raw_content}"
+    )
+    try:
+        chat = groq.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": contenido},
+            ],
+            temperature=0.0,
+            max_tokens=420,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(chat.choices[0].message.content)
+
+        if not data.get("ok"):
+            print(f"  → ❌ {data.get('r', '')}")
+            return None
+
+        fecha_iso = data.get("fecha_iso")
+        if not fecha_iso:
+            print("  → ❌ sin fecha_iso")
+            return None
+
+        fecha_evento = date.fromisoformat(fecha_iso)
+        if not (FECHA_MINIMA <= fecha_evento <= FECHA_MAXIMA):
+            print(f"  → ❌ fecha fuera de rango ({fecha_iso})")
+            return None
+
+        if not data.get("gratis", False):
+            print("  → ❌ no es gratis")
+            return None
+
+        if int(data.get("exclusive_score", 0)) < 1:
+            print("  → ❌ poco especial")
+            return None
+
+        texto = extraer_texto_base(resultado)
+        if contiene_keywords(texto, KEYWORDS_RELIGION):
+            print("  → ❌ religioso")
+            return None
+
+        if contiene_keywords(texto, KEYWORDS_EVENTO_PAGO):
+            print("  → ❌ activación de evento pagado")
+            return None
+
+        comuna = normalizar(data.get("comuna", ""))
+        lugar = normalizar(data.get("lugar", ""))
+        contexto = f"{comuna} {lugar}"
+        if not any(c in contexto for c in COMUNAS_PERMITIDAS):
+            print(f"  → ❌ comuna fuera del foco ({data.get('comuna', '')})")
+            return None
+
+        data["link"] = resultado.get("url", data.get("link", ""))
+        return data
+
+    except Exception as e:
+        msg = str(e)
+        if "429" in msg:
+            print("  → ⚠️ Rate limit Groq")
+        else:
+            print(f"  → ⚠️ Groq error: {msg[:140]}")
+        return None
 
 
-def select_updates(items: list[dict], history: dict[str, dict], force: bool = False) -> list[dict]:
-    updates = []
-    for item in prefer_official(items):
-        old = history.get(dedupe_key(item))
-        if force or not old or old.get("fingerprint") != content_fingerprint(item):
-            updates.append(item)
-    return updates
+# ── Formatear ────────────────────────────────────────────────────────────────
+def formatear_evento(ev: dict) -> str:
+    cat_label = CATEGORIAS.get(ev.get("cat", "otro"), "📌 Evento")
+    hora = ev.get("hora") or "Por confirmar"
+    comuna = ev.get("comuna") or "Santiago"
+    fuente = ev.get("fuente") or extraer_dominio(ev.get("link", ""))
+    motivo_exclusivo = ev.get("motivo_exclusivo") or "Se ve como una fecha puntual con valor especial."
+    evidencia_fecha = ev.get("evidencia_fecha") or "Fecha identificada en la publicación o contenido fuente."
+    return (
+        f"{cat_label} — <b>{ev['nombre']}</b>\n"
+        f"📍 <b>Lugar:</b> {ev['lugar']} ({comuna})\n"
+        f"🗓 <b>Fecha:</b> {ev['fecha']}\n"
+        f"🕒 <b>Hora:</b> {hora}\n"
+        f"🎟 <b>Acceso:</b> Gratis\n"
+        f"✨ <b>Qué pasa:</b> {ev['desc']}\n"
+        f"🔐 <b>Por qué destaca:</b> {motivo_exclusivo}\n"
+        f"🧾 <b>Evidencia de fecha:</b> {evidencia_fecha}\n"
+        f"🌐 <b>Fuente:</b> {fuente}\n"
+        f"🔗 {ev['link']}"
+    )
 
 
-async def send_message(client: httpx.AsyncClient, text: str, config: Config) -> None:
-    if config.dry_run:
-        print(text)
-        return
-    response = await client.post(
-        f"https://api.telegram.org/bot{config.telegram_token}/sendMessage",
+# ── Telegram ─────────────────────────────────────────────────────────────────
+async def telegram_send(client: httpx.AsyncClient, text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    await client.post(
+        url,
         json={
-            "chat_id": config.telegram_chat_id,
+            "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
         },
         timeout=20,
     )
-    response.raise_for_status()
 
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+async def main():
+    aprobados: list[dict] = []
+    dedupe_eventos: set[str] = set()
+    urls_vistas: set[str] = set()
+    procesadas = cargar_procesadas()
+    stats = {
+        "total": 0,
+        "skip_cache": 0,
+        "skip_pre": 0,
+        "rechazados_groq": 0,
+        "aprobados": 0,
+    }
 
 async def run(config: Config) -> list[str]:
     queries = build_queries(config)
     semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
     async with httpx.AsyncClient() as client:
-        batches = await asyncio.gather(
-            *(tavily_search(client, query, config, semaphore) for query in queries),
-            return_exceptions=True,
-        )
-        by_url: dict[str, dict] = {}
-        for batch in batches:
-            if isinstance(batch, BaseException):
-                print(f"[Tavily] consulta omitida: {type(batch).__name__}")
+        resultados_por_query = await asyncio.gather(*(tavily_search(client, q) for q in QUERIES))
+
+        todos: list[dict] = []
+        for resultados in resultados_por_query:
+            for r in resultados:
+                url = r.get("url", "")
+                if url and url not in urls_vistas:
+                    urls_vistas.add(url)
+                    todos.append(r)
+
+        stats["total"] = len(todos)
+        print(f"[Info] {len(todos)} resultados únicos de Tavily")
+
+        candidatos: list[dict] = []
+        for r in todos:
+            url = r.get("url", "")
+            titulo = r.get("title", "")[:90]
+
+            if url in procesadas and deberia_omitir_por_cache(procesadas[url]):
+                previo = procesadas[url]
+                print(f"[Cache-skip] {titulo} — {previo.get('estado')}: {previo.get('detalle')}")
+                stats["skip_cache"] += 1
                 continue
-            for result in batch:
-                if prefilter(result):
-                    by_url.setdefault(str(result.get("url")), result)
-        candidates = sorted(
-            by_url.values(), key=lambda r: is_official_source(str(r.get("url", ""))), reverse=True
-        )[:MAX_CANDIDATES]
-        extracted = await tavily_extract(client, [str(r["url"]) for r in candidates], config)
-        accepted = []
-        for result in candidates:
-            result["raw_content"] = extracted.get(str(result["url"]), "")
-            try:
-                item = groq_evaluate(result, config)
-                valid, reason = validate_panorama(item or {}, config)
-                if valid and item is not None:
-                    accepted.append(item)
-                else:
-                    print(f"[Groq] descartado: {reason}")
-            except (json.JSONDecodeError, ValueError, TypeError, KeyError) as error:
-                print(f"[Groq] respuesta inválida: {type(error).__name__}")
-            except Exception as error:
-                # El SDK puede exponer distintas clases según la versión; solo registramos
-                # el tipo para no filtrar respuestas, URLs con parámetros ni credenciales.
-                print(f"[Groq] solicitud omitida: {type(error).__name__}")
-        updates = select_updates(accepted, load_history(), config.force_resend)[: config.max_events]
-        messages = grouped_messages(updates, datetime.now(CHILE_TZ).date())
-        if updates:
-            summary = f"💑 <b>Panoramas gratuitos</b>\n\nEncontré <b>{len(updates)}</b> nuevos panoramas gratuitos en {safe(config.city)} y {safe(config.region)}."
-            await send_message(client, summary, config)
-            for message in messages:
-                await send_message(client, message, config)
-            if not config.dry_run:
-                for item in updates:
-                    save_history(item)
-        elif config.manual_run:
-            await send_message(
+
+            pasa, motivo, score, razones = prefiltro(r)
+            if not pasa:
+                print(f"[Pre-skip] {titulo} — {motivo}")
+                stats["skip_pre"] += 1
+                guardar_procesada(url, "prefiltro_rechazado", motivo)
+                procesadas[url] = {
+                    "estado": "prefiltro_rechazado",
+                    "detalle": motivo,
+                    "procesado_en": datetime.now(timezone.utc).isoformat(),
+                }
+                continue
+
+            r["prefiltro_score"] = score
+            r["prefiltro_razones"] = razones
+            candidatos.append(r)
+            print(f"[Candidato] {titulo} — score={score} razones={','.join(razones)}")
+
+        candidatos.sort(key=lambda r: r.get("prefiltro_score", 0), reverse=True)
+        candidatos = candidatos[:MAX_CANDIDATOS_GROQ]
+
+        extraidos = await tavily_extract(client, [r["url"] for r in candidatos])
+        for r in candidatos:
+            r["raw_content"] = extraidos.get(r["url"], "")
+
+        for r in candidatos:
+            url = r.get("url", "")
+            titulo = r.get("title", "")[:90]
+            print(f"[→ Groq] {titulo} — score={r.get('prefiltro_score')}")
+            ev = groq_evaluar(r)
+            if ev:
+                clave = dedupe_key_evento(ev)
+                if clave in dedupe_eventos:
+                    print(f"  → ↪ duplicado {ev['nombre']} {ev.get('fecha_iso')}")
+                    continue
+                dedupe_eventos.add(clave)
+                aprobados.append(ev)
+                stats["aprobados"] += 1
+                guardar_procesada(url, "aprobado", ev.get("nombre", "ok"), ev.get("fecha_iso"))
+                procesadas[url] = {
+                    "estado": "aprobado",
+                    "detalle": ev.get("nombre", "ok"),
+                    "procesado_en": datetime.now(timezone.utc).isoformat(),
+                }
+                print(f"  → ✅ {ev['nombre']} [{ev.get('cat', '?')}] {ev.get('fecha_iso')}")
+            else:
+                stats["rechazados_groq"] += 1
+                guardar_procesada(url, "groq_rechazado", "sin evidencia suficiente")
+                procesadas[url] = {
+                    "estado": "groq_rechazado",
+                    "detalle": "sin evidencia suficiente",
+                    "procesado_en": datetime.now(timezone.utc).isoformat(),
+                }
+
+        aprobados = sorted(
+            aprobados,
+            key=lambda e: (e.get("fecha_iso") or "9999-99-99", e.get("hora") or "99:99"),
+        )[:MAX_EVENTOS]
+
+        print(
+            "\n[Stats] "
+            f"total={stats['total']} | cache={stats['skip_cache']} | pre-skip={stats['skip_pre']} | "
+            f"groq-rechazó={stats['rechazados_groq']} | aprobados={stats['aprobados']}"
+        )
+
+        if not aprobados:
+            await telegram_send(
                 client,
-                "💑 <b>Panoramas gratuitos</b>\n\nNo encontré novedades verificadas.",
-                config,
+                (
+                    f"🔎 <b>Eventos exclusivos y gratis en Santiago</b>\n"
+                    f"📅 Ventana: 19 de marzo a 30 de septiembre de 2026\n\n"
+                    "No encontré resultados con evidencia suficiente de fecha y gratuidad. "
+                    "El bot descartó notas genéricas, búsquedas vacías, eventos pasados, religión y publicaciones sospechosas."
+                ),
             )
-        return messages
+        else:
+            await telegram_send(
+                client,
+                (
+                    f"🗺 <b>Eventos exclusivos y gratis — Santiago de Chile</b>\n"
+                    f"📅 Filtro: posteriores al 18 de marzo de 2026\n"
+                    f"✅ Encontrados: <b>{len(aprobados)}</b> evento(s) con fecha verificable"
+                ),
+            )
+            for ev in aprobados:
+                await telegram_send(client, formatear_evento(ev))
 
-
-async def main() -> None:
-    await run(Config.from_env())
+        print(f"[Done] {len(aprobados)} evento(s) enviados")
 
 
 if __name__ == "__main__":
