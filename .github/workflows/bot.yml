@@ -1,14 +1,58 @@
-name: Bot Eventos Gratis Santiago
+name: Panoramas gratuitos para parejas
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # 9:00 AM hora Chile
-    - cron: "0 18 * * *"   # 3:00 PM hora Chile
+    # Miércoles y domingo a las 13:00 UTC: aprox. 09:00 Chile en invierno.
+    - cron: "0 13 * * 0,3"
   workflow_dispatch:
+    inputs:
+      start_date:
+        description: Fecha inicial (YYYY-MM-DD)
+        required: false
+        default: "2026-08-01"
+      end_date:
+        description: Fecha final (YYYY-MM-DD)
+        required: false
+        default: "2026-08-31"
+      city:
+        description: Ciudad
+        required: false
+        default: Santiago
+      region:
+        description: Región
+        required: false
+        default: Región Metropolitana
+      max_events:
+        description: Máximo de panoramas
+        required: false
+        default: "20"
+      force_resend:
+        description: Enviar aunque ya estén procesados
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: panoramas-gratuitos
+  cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      EVENT_START_DATE: ${{ inputs.start_date || '2026-08-01' }}
+      EVENT_END_DATE: ${{ inputs.end_date || '2026-08-31' }}
+      EVENT_CITY: ${{ inputs.city || 'Santiago' }}
+      EVENT_REGION: ${{ inputs.region || 'Región Metropolitana' }}
+      MAX_EVENTS_PER_RUN: ${{ inputs.max_events || '20' }}
+      FORCE_RESEND: ${{ inputs.force_resend || 'false' }}
+      ONLY_FREE: "true"
+      COUPLE_MODE: "true"
+      DRY_RUN: "false"
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -17,9 +61,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
-        run: pip install httpx groq
+        run: python -m pip install -r requirements.txt
+
+      - name: Restore processed history
+        id: history
+        uses: actions/cache/restore@v4
+        with:
+          path: procesadas.txt
+          key: panoramas-history-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            panoramas-history-
 
       - name: Run bot
         env:
@@ -28,3 +82,10 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
+
+      - name: Save processed history
+        if: always() && hashFiles('procesadas.txt') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: procesadas.txt
+          key: panoramas-history-${{ github.run_id }}-${{ github.run_attempt }}
