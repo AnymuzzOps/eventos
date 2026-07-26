@@ -6,9 +6,17 @@ on:
     - cron: "0 18 * * *"   # 3:00 PM hora Chile
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: eventos-bot
+  cancel-in-progress: false
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -19,7 +27,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install httpx groq
+        run: python -m pip install -r requirements.txt
 
       - name: Run bot
         env:

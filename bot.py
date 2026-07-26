@@ -1,18 +1,20 @@
 import asyncio
+import html
 import json
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 from groq import Groq
 
 # ── Config ──────────────────────────────────────────────────────────────────
-TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 PROCESADAS_PATH = Path("procesadas.txt")
@@ -22,7 +24,7 @@ EXTRACT_CHARS = 5000
 CACHE_TTL_APROBADO_DIAS = 90
 CACHE_TTL_RECHAZADO_DIAS = 10
 
-CHILE_TZ = timezone(timedelta(hours=-3))
+CHILE_TZ = ZoneInfo("America/Santiago")
 ahora = datetime.now(CHILE_TZ)
 hoy_dt = ahora.date()
 hoy = ahora.strftime("%-d de %B de %Y")
@@ -368,7 +370,7 @@ def guardar_procesada(url: str, estado: str, detalle: str, fecha_iso: str | None
         "estado": estado,
         "detalle": detalle,
         "fecha_iso": fecha_iso,
-        "procesado_en": datetime.now(timezone.utc).isoformat(),
+        "procesado_en": datetime.now(UTC).isoformat(),
     }
     with PROCESADAS_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -385,7 +387,7 @@ def deberia_omitir_por_cache(entry: dict) -> bool:
     except ValueError:
         return False
 
-    edad = datetime.now(timezone.utc) - fecha_cache
+    edad = datetime.now(UTC) - fecha_cache
     ttl_dias = CACHE_TTL_APROBADO_DIAS if estado == "aprobado" else CACHE_TTL_RECHAZADO_DIAS
     return edad <= timedelta(days=ttl_dias)
 
@@ -396,10 +398,19 @@ def normalizar(texto: str) -> str:
 
 
 def extraer_dominio(url: str) -> str:
-    try:
-        return urlparse(url).netloc.lower().removeprefix("www.")
-    except Exception:
-        return ""
+    return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+def validar_configuracion() -> None:
+    requeridas = {
+        "TAVILY_API_KEY": TAVILY_API_KEY,
+        "GROQ_API_KEY": GROQ_API_KEY,
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    }
+    faltantes = [nombre for nombre, valor in requeridas.items() if not valor.strip()]
+    if faltantes:
+        raise RuntimeError("Faltan variables de entorno requeridas: " + ", ".join(faltantes))
 
 
 def es_url_busqueda(url: str) -> bool:
@@ -410,10 +421,7 @@ def es_url_busqueda(url: str) -> bool:
     if "/discover/" in path or "/search" in path or "/explore/" in path:
         return True
 
-    if any(key in query for key in ["q", "query", "keyword", "search"]):
-        return True
-
-    return False
+    return any(key in query for key in ["q", "query", "keyword", "search"])
 
 
 def contiene_keywords(texto: str, keywords: list[str]) -> bool:
@@ -452,7 +460,9 @@ def score_resultado(r: dict) -> tuple[int, list[str]]:
         score += 3
         razones.append("año_2026")
 
-    if any(mes in texto for mes in ["marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre"]):
+    if any(
+        mes in texto for mes in ["marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre"]
+    ):
         score += 2
         razones.append("mes_objetivo")
 
@@ -662,30 +672,37 @@ def groq_evaluar(resultado: dict) -> dict | None:
 
 # ── Formatear ────────────────────────────────────────────────────────────────
 def formatear_evento(ev: dict) -> str:
-    cat_label = CATEGORIAS.get(ev.get("cat", "otro"), "📌 Evento")
-    hora = ev.get("hora") or "Por confirmar"
-    comuna = ev.get("comuna") or "Santiago"
-    fuente = ev.get("fuente") or extraer_dominio(ev.get("link", ""))
-    motivo_exclusivo = ev.get("motivo_exclusivo") or "Se ve como una fecha puntual con valor especial."
-    evidencia_fecha = ev.get("evidencia_fecha") or "Fecha identificada en la publicación o contenido fuente."
+    def seguro(valor: object) -> str:
+        return html.escape(str(valor), quote=False)
+
+    cat_label = seguro(CATEGORIAS.get(ev.get("cat", "otro"), "📌 Evento"))
+    hora = seguro(ev.get("hora") or "Por confirmar")
+    comuna = seguro(ev.get("comuna") or "Santiago")
+    fuente = seguro(ev.get("fuente") or extraer_dominio(ev.get("link", "")))
+    motivo_exclusivo = seguro(
+        ev.get("motivo_exclusivo") or "Se ve como una fecha puntual con valor especial."
+    )
+    evidencia_fecha = seguro(
+        ev.get("evidencia_fecha") or "Fecha identificada en la publicación o contenido fuente."
+    )
     return (
-        f"{cat_label} — <b>{ev['nombre']}</b>\n"
-        f"📍 <b>Lugar:</b> {ev['lugar']} ({comuna})\n"
-        f"🗓 <b>Fecha:</b> {ev['fecha']}\n"
+        f"{cat_label} — <b>{seguro(ev['nombre'])}</b>\n"
+        f"📍 <b>Lugar:</b> {seguro(ev['lugar'])} ({comuna})\n"
+        f"🗓 <b>Fecha:</b> {seguro(ev['fecha'])}\n"
         f"🕒 <b>Hora:</b> {hora}\n"
         f"🎟 <b>Acceso:</b> Gratis\n"
-        f"✨ <b>Qué pasa:</b> {ev['desc']}\n"
+        f"✨ <b>Qué pasa:</b> {seguro(ev['desc'])}\n"
         f"🔐 <b>Por qué destaca:</b> {motivo_exclusivo}\n"
         f"🧾 <b>Evidencia de fecha:</b> {evidencia_fecha}\n"
         f"🌐 <b>Fuente:</b> {fuente}\n"
-        f"🔗 {ev['link']}"
+        f"🔗 {seguro(ev['link'])}"
     )
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 async def telegram_send(client: httpx.AsyncClient, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    await client.post(
+    response = await client.post(
         url,
         json={
             "chat_id": TELEGRAM_CHAT_ID,
@@ -695,10 +712,12 @@ async def telegram_send(client: httpx.AsyncClient, text: str):
         },
         timeout=20,
     )
+    response.raise_for_status()
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 async def main():
+    validar_configuracion()
     aprobados: list[dict] = []
     dedupe_eventos: set[str] = set()
     urls_vistas: set[str] = set()
@@ -744,7 +763,7 @@ async def main():
                 procesadas[url] = {
                     "estado": "prefiltro_rechazado",
                     "detalle": motivo,
-                    "procesado_en": datetime.now(timezone.utc).isoformat(),
+                    "procesado_en": datetime.now(UTC).isoformat(),
                 }
                 continue
 
@@ -777,7 +796,7 @@ async def main():
                 procesadas[url] = {
                     "estado": "aprobado",
                     "detalle": ev.get("nombre", "ok"),
-                    "procesado_en": datetime.now(timezone.utc).isoformat(),
+                    "procesado_en": datetime.now(UTC).isoformat(),
                 }
                 print(f"  → ✅ {ev['nombre']} [{ev.get('cat', '?')}] {ev.get('fecha_iso')}")
             else:
@@ -786,7 +805,7 @@ async def main():
                 procesadas[url] = {
                     "estado": "groq_rechazado",
                     "detalle": "sin evidencia suficiente",
-                    "procesado_en": datetime.now(timezone.utc).isoformat(),
+                    "procesado_en": datetime.now(UTC).isoformat(),
                 }
 
         aprobados = sorted(
@@ -804,8 +823,8 @@ async def main():
             await telegram_send(
                 client,
                 (
-                    f"🔎 <b>Eventos exclusivos y gratis en Santiago</b>\n"
-                    f"📅 Ventana: 19 de marzo a 30 de septiembre de 2026\n\n"
+                    "🔎 <b>Eventos exclusivos y gratis en Santiago</b>\n"
+                    "📅 Ventana: 19 de marzo a 30 de septiembre de 2026\n\n"
                     "No encontré resultados con evidencia suficiente de fecha y gratuidad. "
                     "El bot descartó notas genéricas, búsquedas vacías, eventos pasados, religión y publicaciones sospechosas."
                 ),
