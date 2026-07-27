@@ -462,6 +462,8 @@ def category_label(item: dict) -> str:
 def safe(value: object, fallback: str = "No informado") -> str:
     return html.escape(str(value or fallback), quote=False)
 
+def safe(value: object, fallback: str = "No informado") -> str:
+    return html.escape(str(value or fallback), quote=False)
 
 def format_panorama(item: dict, verified_at: date) -> str:
     reservation = "Requiere reserva gratuita" if item.get("requiere_reserva") else "Sin reserva"
