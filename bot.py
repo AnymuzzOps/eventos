@@ -22,6 +22,7 @@ MIN_CONFIDENCE = 70
 MAX_CANDIDATES = 40
 SEARCH_CONCURRENCY = 5
 EXTRACT_CHARS = 5000
+TAVILY_EXTRACT_BATCH_SIZE = 20
 
 COMUNAS_RM = {
     "alhue",
@@ -404,26 +405,58 @@ async def tavily_search(
         return response.json().get("results", [])
 
 
+def chunked(items: list[str], size: int) -> list[list[str]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
 async def tavily_extract(
     client: httpx.AsyncClient, urls: list[str], config: Config
 ) -> dict[str, str]:
-    if not urls:
+    unique_urls = list(dict.fromkeys(url for url in urls if url))
+    if not unique_urls:
         return {}
-    response = await client.post(
-        "https://api.tavily.com/extract",
-        json={
-            "api_key": config.tavily_api_key,
-            "urls": urls,
-            "extract_depth": "advanced",
-        },
-        timeout=45,
-    )
-    response.raise_for_status()
-    return {
-        item["url"]: (item.get("raw_content") or item.get("content") or "")[:EXTRACT_CHARS]
-        for item in response.json().get("results", [])
-        if item.get("url")
-    }
+
+    extracted: dict[str, str] = {}
+    batches = chunked(unique_urls, TAVILY_EXTRACT_BATCH_SIZE)
+    for batch_number, batch in enumerate(batches, start=1):
+        try:
+            response = await client.post(
+                "https://api.tavily.com/extract",
+                json={
+                    "api_key": config.tavily_api_key,
+                    "urls": batch,
+                    "extract_depth": "advanced",
+                },
+                timeout=45,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            results = payload.get("results", [])
+            for item in results:
+                url = item.get("url")
+                content = item.get("raw_content") or item.get("content") or ""
+                if url and content:
+                    extracted[url] = content[:EXTRACT_CHARS]
+
+            failed_count = len(payload.get("failed_results", []))
+            print(
+                f"[Tavily extract] lote {batch_number}/{len(batches)} "
+                f"procesado: {len(results)} resultados, {failed_count} fallidos"
+            )
+        except httpx.HTTPStatusError as error:
+            print(
+                f"[Tavily extract] lote {batch_number}/{len(batches)} "
+                f"omitido: HTTP {error.response.status_code}"
+            )
+        except httpx.RequestError:
+            print(f"[Tavily extract] lote {batch_number}/{len(batches)} omitido: error de red")
+        except Exception as error:
+            print(
+                f"[Tavily extract] lote {batch_number}/{len(batches)} "
+                f"omitido: {type(error).__name__}"
+            )
+
+    return extracted
 
 
 def groq_evaluate(result: dict, config: Config) -> dict | None:
