@@ -463,6 +463,8 @@ def category_label(item: dict) -> str:
         "🚶 Recorridos y panoramas urbanos",
     )
 
+def safe(value: object, fallback: str = "No informado") -> str:
+    return html.escape(str(value or fallback), quote=False)
 
 def safe(value: object, fallback: str = "No informado") -> str:
     return html.escape(str(value or fallback), quote=False)
