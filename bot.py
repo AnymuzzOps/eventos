@@ -4,6 +4,7 @@ import html
 import json
 import os
 import unicodedata
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -16,13 +17,15 @@ from groq import Groq
 CHILE_TZ = ZoneInfo("America/Santiago")
 PROCESADAS_PATH = Path("procesadas.txt")
 TELEGRAM_MAX_CHARS = 3900
+TELEGRAM_MAX_ATTEMPTS = 4
+TELEGRAM_RETRY_BASE_SECONDS = 2
+TELEGRAM_MAX_RETRY_AFTER_SECONDS = 60
 CACHE_TTL_APROBADO_DIAS = 1
 CACHE_TTL_RECHAZADO_DIAS = 7
 MIN_CONFIDENCE = 70
 MAX_CANDIDATES = 40
 SEARCH_CONCURRENCY = 5
 EXTRACT_CHARS = 5000
-TAVILY_EXTRACT_BATCH_SIZE = 20
 
 COMUNAS_RM = {
     "alhue",
@@ -405,58 +408,26 @@ async def tavily_search(
         return response.json().get("results", [])
 
 
-def chunked(items: list[str], size: int) -> list[list[str]]:
-    return [items[index : index + size] for index in range(0, len(items), size)]
-
-
 async def tavily_extract(
     client: httpx.AsyncClient, urls: list[str], config: Config
 ) -> dict[str, str]:
-    unique_urls = list(dict.fromkeys(url for url in urls if url))
-    if not unique_urls:
+    if not urls:
         return {}
-
-    extracted: dict[str, str] = {}
-    batches = chunked(unique_urls, TAVILY_EXTRACT_BATCH_SIZE)
-    for batch_number, batch in enumerate(batches, start=1):
-        try:
-            response = await client.post(
-                "https://api.tavily.com/extract",
-                json={
-                    "api_key": config.tavily_api_key,
-                    "urls": batch,
-                    "extract_depth": "advanced",
-                },
-                timeout=45,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            results = payload.get("results", [])
-            for item in results:
-                url = item.get("url")
-                content = item.get("raw_content") or item.get("content") or ""
-                if url and content:
-                    extracted[url] = content[:EXTRACT_CHARS]
-
-            failed_count = len(payload.get("failed_results", []))
-            print(
-                f"[Tavily extract] lote {batch_number}/{len(batches)} "
-                f"procesado: {len(results)} resultados, {failed_count} fallidos"
-            )
-        except httpx.HTTPStatusError as error:
-            print(
-                f"[Tavily extract] lote {batch_number}/{len(batches)} "
-                f"omitido: HTTP {error.response.status_code}"
-            )
-        except httpx.RequestError:
-            print(f"[Tavily extract] lote {batch_number}/{len(batches)} omitido: error de red")
-        except Exception as error:
-            print(
-                f"[Tavily extract] lote {batch_number}/{len(batches)} "
-                f"omitido: {type(error).__name__}"
-            )
-
-    return extracted
+    response = await client.post(
+        "https://api.tavily.com/extract",
+        json={
+            "api_key": config.tavily_api_key,
+            "urls": urls,
+            "extract_depth": "advanced",
+        },
+        timeout=45,
+    )
+    response.raise_for_status()
+    return {
+        item["url"]: (item.get("raw_content") or item.get("content") or "")[:EXTRACT_CHARS]
+        for item in response.json().get("results", [])
+        if item.get("url")
+    }
 
 
 def groq_evaluate(result: dict, config: Config) -> dict | None:
@@ -492,6 +463,8 @@ def category_label(item: dict) -> str:
         "🚶 Recorridos y panoramas urbanos",
     )
 
+def safe(value: object, fallback: str = "No informado") -> str:
+    return html.escape(str(value or fallback), quote=False)
 
 def safe(value: object, fallback: str = "No informado") -> str:
     return html.escape(str(value or fallback), quote=False)
@@ -602,17 +575,52 @@ async def send_message(client: httpx.AsyncClient, text: str, config: Config) -> 
     if config.dry_run:
         print(text)
         return
-    response = await client.post(
-        f"https://api.telegram.org/bot{config.telegram_token}/sendMessage",
-        json={
-            "chat_id": config.telegram_chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
+
+    retryable_statuses = {429, 500, 502, 503, 504}
+    for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
+        try:
+            response = await client.post(
+                f"https://api.telegram.org/bot{config.telegram_token}/sendMessage",
+                json={
+                    "chat_id": config.telegram_chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": False,
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            print(f"[Telegram] intento {attempt}/{TELEGRAM_MAX_ATTEMPTS} enviado correctamente")
+            return
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            if status not in retryable_statuses or attempt == TELEGRAM_MAX_ATTEMPTS:
+                raise
+
+            delay = TELEGRAM_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            if status == 429:
+                retry_after: object = None
+                with suppress(ValueError, AttributeError):
+                    retry_after = error.response.json().get("parameters", {}).get("retry_after")
+                retry_after = retry_after or error.response.headers.get("Retry-After")
+                with suppress(TypeError, ValueError):
+                    assert isinstance(retry_after, (str, int, float))
+                    delay = min(float(retry_after), TELEGRAM_MAX_RETRY_AFTER_SECONDS)
+
+            print(
+                f"[Telegram] intento {attempt}/{TELEGRAM_MAX_ATTEMPTS} falló: HTTP {status}; "
+                f"reintento en {delay:g}s"
+            )
+        except (httpx.TimeoutException, httpx.RequestError) as error:
+            if attempt == TELEGRAM_MAX_ATTEMPTS:
+                raise
+            delay = TELEGRAM_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            print(
+                f"[Telegram] intento {attempt}/{TELEGRAM_MAX_ATTEMPTS} falló: "
+                f"{type(error).__name__}; reintento en {delay}s"
+            )
+
+        await asyncio.sleep(delay)
 
 
 async def run(config: Config) -> list[str]:

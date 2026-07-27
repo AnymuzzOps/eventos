@@ -1,8 +1,10 @@
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import httpx
+import pytest
 
 import bot
 
@@ -155,99 +157,155 @@ def test_configuracion_es_dinamica(monkeypatch):
     assert not any("agosto 2026" in query for query in queries)
 
 
-class ExtractResponse:
-    def __init__(self, payload, status_code=200):
-        self.payload = payload
-        self.status_code = status_code
-        self.request = httpx.Request("POST", "https://api.tavily.com/extract")
-        self.response = httpx.Response(status_code, request=self.request)
+class TelegramResponse:
+    def __init__(self, status_code=200, payload=None, headers=None):
+        request = httpx.Request("POST", "https://api.telegram.org/bot-redacted/sendMessage")
+        self.response = httpx.Response(
+            status_code,
+            request=request,
+            json=payload or {},
+            headers=headers,
+        )
 
     def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                "extract failed", request=self.request, response=self.response
-            )
-
-    def json(self):
-        return self.payload
+        self.response.raise_for_status()
 
 
-class ExtractClient:
-    def __init__(self, responses=None):
-        self.responses = list(responses or [])
+class TelegramClient:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
         self.calls = []
 
     async def post(self, url, json, timeout):
         self.calls.append({"url": url, "json": json, "timeout": timeout})
-        if self.responses:
-            return self.responses.pop(0)
-        return ExtractResponse(
-            {"results": [{"url": item, "raw_content": f"content:{item}"} for item in json["urls"]]}
-        )
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
-def test_tavily_extract_divide_45_urls_en_tres_lotes():
-    urls = [f"https://example.com/{index}" for index in range(45)]
-    client = ExtractClient()
-
-    extracted = asyncio.run(bot.tavily_extract(client, urls, config()))
-
-    batches = [call["json"]["urls"] for call in client.calls]
-    assert [len(batch) for batch in batches] == [20, 20, 5]
-    assert all(len(batch) <= bot.TAVILY_EXTRACT_BATCH_SIZE for batch in batches)
-    assert list(extracted) == urls
-
-
-def test_tavily_extract_elimina_duplicados_y_conserva_orden():
-    urls = ["https://example.com/1", "https://example.com/2", "https://example.com/1", ""]
-    client = ExtractClient()
-
-    asyncio.run(bot.tavily_extract(client, urls, config()))
-
-    assert client.calls[0]["json"]["urls"] == urls[:2]
-
-
-def test_tavily_extract_conserva_resultados_si_un_lote_falla():
-    urls = [f"https://example.com/{index}" for index in range(45)]
-
-    def successful(batch):
-        return ExtractResponse({"results": [{"url": url, "content": url} for url in batch]})
-
-    client = ExtractClient(
-        [
-            successful(urls[:20]),
-            ExtractResponse({}, status_code=400),
-            successful(urls[40:]),
-        ]
+def telegram_config(dry_run=False):
+    return replace(
+        config(),
+        telegram_token="secret-token",
+        telegram_chat_id="secret-chat-id",
+        dry_run=dry_run,
     )
 
-    extracted = asyncio.run(bot.tavily_extract(client, urls, config()))
 
-    assert list(extracted) == urls[:20] + urls[40:]
-    assert len(client.calls) == 3
+def no_wait(monkeypatch):
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return delays
 
 
-def test_tavily_extract_lista_vacia_no_hace_solicitudes():
-    client = ExtractClient()
+def test_telegram_exito_inmediato(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = TelegramClient([TelegramResponse()])
 
-    assert asyncio.run(bot.tavily_extract(client, [], config())) == {}
+    asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
+
+    assert len(client.calls) == 1
+    assert delays == []
+
+
+def test_telegram_502_seguido_de_exito(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = TelegramClient([TelegramResponse(502), TelegramResponse()])
+
+    asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
+
+    assert len(client.calls) == 2
+    assert delays == [2]
+
+
+def test_telegram_tres_502_y_exito_en_cuarto_intento(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = TelegramClient([TelegramResponse(502)] * 3 + [TelegramResponse()])
+
+    asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
+
+    assert len(client.calls) == 4
+    assert delays == [2, 4, 8]
+
+
+def test_telegram_cuatro_503_relanza(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = TelegramClient([TelegramResponse(503)] * 4)
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
+
+    assert error.value.response.status_code == 503
+    assert len(client.calls) == 4
+    assert delays == [2, 4, 8]
+
+
+def test_telegram_401_no_reintenta(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = TelegramClient([TelegramResponse(401)])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
+
+    assert len(client.calls) == 1
+    assert delays == []
+
+
+def test_telegram_429_usa_parameters_retry_after(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = TelegramClient(
+        [TelegramResponse(429, {"parameters": {"retry_after": 12}}), TelegramResponse()]
+    )
+
+    asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
+
+    assert delays == [12]
+
+
+def test_telegram_429_usa_header_retry_after_y_limita_espera(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = TelegramClient(
+        [TelegramResponse(429, headers={"Retry-After": "90"}), TelegramResponse()]
+    )
+
+    asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
+
+    assert delays == [bot.TELEGRAM_MAX_RETRY_AFTER_SECONDS]
+
+
+def test_telegram_timeout_seguido_de_exito(monkeypatch):
+    delays = no_wait(monkeypatch)
+    request = httpx.Request("POST", "https://api.telegram.org/bot-redacted/sendMessage")
+    client = TelegramClient([httpx.ReadTimeout("timeout", request=request), TelegramResponse()])
+
+    asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
+
+    assert len(client.calls) == 2
+    assert delays == [2]
+
+
+def test_telegram_dry_run_no_hace_llamadas_ni_espera(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = TelegramClient([])
+
+    asyncio.run(bot.send_message(client, "mensaje", telegram_config(dry_run=True)))
+
     assert client.calls == []
+    assert delays == []
 
 
-def test_tavily_extract_tolera_failed_results_y_content_alternativo():
-    client = ExtractClient(
-        [
-            ExtractResponse(
-                {
-                    "results": [{"url": "https://example.com/ok", "content": "contenido"}],
-                    "failed_results": [{"url": "https://example.com/fail", "error": "failed"}],
-                }
-            )
-        ]
-    )
+def test_telegram_logs_no_exponen_token_ni_chat_id(monkeypatch, capsys):
+    no_wait(monkeypatch)
+    client = TelegramClient([TelegramResponse(502), TelegramResponse()])
 
-    extracted = asyncio.run(
-        bot.tavily_extract(client, ["https://example.com/ok", "https://example.com/fail"], config())
-    )
+    asyncio.run(bot.send_message(client, "mensaje", telegram_config()))
 
-    assert extracted == {"https://example.com/ok": "contenido"}
+    logs = capsys.readouterr().out
+    assert "secret-token" not in logs
+    assert "secret-chat-id" not in logs
+    assert "api.telegram.org" not in logs
