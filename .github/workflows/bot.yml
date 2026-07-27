@@ -39,13 +39,6 @@ concurrency:
   group: panoramas-gratuitos
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
-concurrency:
-  group: eventos-bot
-  cancel-in-progress: false
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
