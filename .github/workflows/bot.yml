@@ -39,13 +39,6 @@ concurrency:
   group: panoramas-gratuitos
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
-concurrency:
-  group: eventos-bot
-  cancel-in-progress: false
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -82,9 +75,32 @@ jobs:
           restore-keys: |
             panoramas-history-
 
+      - name: Diagnose Telegram IPv4 connectivity
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        shell: bash
+        run: |
+          status="$(
+            curl -4 \
+              --silent \
+              --show-error \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --connect-timeout 10 \
+              --max-time 20 \
+              "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getMe" \
+              || true
+          )"
+
+          if [ -z "$status" ] || [ "$status" = "000" ]; then
+            echo "[Telegram diagnóstico] conexión IPv4 no disponible"
+          else
+            echo "[Telegram diagnóstico] HTTP $status"
+          fi
+
       - name: Run bot
         env:
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

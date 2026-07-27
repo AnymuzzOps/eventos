@@ -1,6 +1,6 @@
 # Panoramas gratuitos para parejas
 
-Bot en Python 3.11 que busca con Tavily panoramas gratuitos en Santiago y la Región
+Bot en Python 3.11 que busca con Exa panoramas gratuitos en Santiago y la Región
 Metropolitana, extrae y verifica información estructurada con Groq y envía novedades agrupadas
 a Telegram. Acepta eventos con fecha y lugares visitables cuando una fuente verificable acredita
 su disponibilidad dentro del periodo.
@@ -27,7 +27,7 @@ python -m pip install -r requirements-dev.txt
 cp .env.example .env
 ```
 
-Se requieren credenciales de Tavily, Groq y Telegram. Nunca confirmes `.env` ni uses secretos de
+Se requieren credenciales de Exa, Groq y Telegram. Nunca confirmes `.env` ni uses secretos de
 producción durante pruebas.
 
 ## Configurar agosto de 2026
@@ -57,7 +57,7 @@ set -a; source .env; set +a
 python bot.py
 ```
 
-Este modo **sí consulta Tavily y Groq** si se ejecuta el flujo completo, pero imprime los mensajes
+Este modo **sí consulta Exa y Groq** si se ejecuta el flujo completo, pero imprime los mensajes
 y nunca contacta Telegram. La suite automatizada no llama ninguna API:
 
 ```bash
@@ -73,7 +73,7 @@ Para una prueba totalmente offline usa `pytest`; sus clientes y datos son simula
 ## Ejecución real y manual
 
 Cambia `DRY_RUN=false`, carga las cuatro credenciales y ejecuta `python bot.py`. En GitHub Actions,
-configura `TAVILY_API_KEY`, `GROQ_API_KEY`, `TELEGRAM_TOKEN` y `TELEGRAM_CHAT_ID` como *Secrets*.
+configura `EXA_API_KEY`, `GROQ_API_KEY`, `TELEGRAM_TOKEN` y `TELEGRAM_CHAT_ID` como *Secrets*.
 Luego abre **Actions → Panoramas gratuitos para parejas → Run workflow**. El formulario permite
 cambiar fechas, ciudad, región, máximo de resultados y reenvío de procesados.
 
@@ -91,10 +91,10 @@ Se prioriza una URL oficial al consolidar publicaciones duplicadas.
 y la información superó las validaciones automáticas. No garantiza que el organizador no cambie o
 cancele posteriormente; abre siempre el enlace antes de salir.
 
-Una ejecución genera actualmente 52 consultas Tavily, con hasta 6 resultados por consulta, una
-extracción por lote y como máximo 40 clasificaciones Groq. Errores de búsquedas individuales no
-cancelan todo el proceso. Ajustar comunas o consultas cambia directamente el consumo; revisa las
-cuotas de cada proveedor antes de ampliarlas.
+Una ejecución genera 10 consultas Exa, con hasta 8 resultados por consulta y como máximo 20
+clasificaciones Groq. Los highlights devueltos por Exa se usan directamente, sin una extracción
+separada. Errores de búsquedas individuales no cancelan todo el proceso; revisa las cuotas de cada
+proveedor antes de ampliar las consultas.
 
 ## Deduplicación e historial
 
