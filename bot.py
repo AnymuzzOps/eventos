@@ -23,10 +23,9 @@ TELEGRAM_MAX_RETRY_AFTER_SECONDS = 60
 CACHE_TTL_APROBADO_DIAS = 1
 CACHE_TTL_RECHAZADO_DIAS = 7
 MIN_CONFIDENCE = 70
-MAX_CANDIDATES = 40
+MAX_CANDIDATES = 20
 SEARCH_CONCURRENCY = 5
 EXTRACT_CHARS = 5000
-TAVILY_EXTRACT_BATCH_SIZE = 20
 
 COMUNAS_RM = {
     "alhue",
@@ -158,7 +157,7 @@ def parse_bool(value: str, name: str) -> bool:
 
 @dataclass(frozen=True)
 class Config:
-    tavily_api_key: str
+    exa_api_key: str
     groq_api_key: str
     telegram_token: str
     telegram_chat_id: str
@@ -190,7 +189,7 @@ class Config:
         if not 1 <= maximum <= 100:
             raise ValueError("MAX_EVENTS_PER_RUN debe estar entre 1 y 100")
         config = cls(
-            tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
+            exa_api_key=os.getenv("EXA_API_KEY", ""),
             groq_api_key=os.getenv("GROQ_API_KEY", ""),
             telegram_token=os.getenv("TELEGRAM_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -208,7 +207,7 @@ class Config:
         )
         if require_secrets and not config.dry_run:
             required = {
-                "TAVILY_API_KEY": config.tavily_api_key,
+                "EXA_API_KEY": config.exa_api_key,
                 "GROQ_API_KEY": config.groq_api_key,
                 "TELEGRAM_TOKEN": config.telegram_token,
                 "TELEGRAM_CHAT_ID": config.telegram_chat_id,
@@ -330,32 +329,21 @@ def prefer_official(items: list[dict]) -> list[dict]:
 
 
 def build_queries(config: Config) -> list[str]:
-    month = config.start_date.strftime("%m/%Y")
     month_name = SPANISH_MONTHS[config.start_date.month - 1]
     month_year = f"{month_name} {config.start_date.year}"
     period = f"{config.start_date.isoformat()} {config.end_date.isoformat()}"
-    base = [
+    return [
         f"eventos gratis {config.city} {month_year}",
-        f"panoramas gratuitos {config.city} {month_year}",
-        f"actividades gratuitas {config.region} {month_year}",
-        "jardines gratuitos Santiago",
-        "parques para visitar en pareja Santiago",
-        "museos gratis Santiago",
+        f"panoramas gratuitos {config.region} {period}",
+        f"conciertos gratuitos {config.city} {month_year}",
         f"exposiciones gratuitas {config.city} {month_year}",
-        f"conciertos gratis {config.city} {month_year}",
-        f"actividades municipales {month_year} {config.region}",
-        f"entrada liberada {config.city} {month_year}",
-        f"recorridos patrimoniales gratis {config.region} {month}",
+        f"museos y centros culturales gratuitos {config.region} {period}",
+        f"actividades municipales gratuitas {config.city} {month_year}",
         f"cine al aire libre gratis {config.region} {period}",
-        f"site:chilecultura.gob.cl gratis {config.region} {month_year}",
-        f"site:santiagocultura.cl gratis {month_year}",
-        f"site:parquemet.cl actividades gratis {period}",
-        f"museos bibliotecas centros culturales entrada liberada {config.region} {period}",
+        f"ferias y talleres gratuitos {config.city} {month_year}",
+        f"recorridos patrimoniales gratuitos {config.region} {period}",
+        f"parques jardines y naturaleza gratuitos {config.region} {month_year}",
     ]
-    for comuna in COMUNAS_BUSQUEDA:
-        base.append(f"site:*.cl actividades gratis {comuna} {month_year} municipalidad cultura")
-        base.append(f"panoramas gratis {comuna} {month_year} fuente oficial")
-    return list(dict.fromkeys(base))
 
 
 def system_prompt(config: Config) -> str:
@@ -389,76 +377,52 @@ def prefilter(result: dict) -> bool:
     return not any(word in text for word in negatives)
 
 
-async def tavily_search(
-    client: httpx.AsyncClient, query: str, config: Config, semaphore: asyncio.Semaphore
+async def exa_search(
+    client: httpx.AsyncClient,
+    query: str,
+    config: Config,
+    semaphore: asyncio.Semaphore,
+    include_domains: list[str] | None = None,
 ) -> list[dict]:
     async with semaphore:
+        payload: dict[str, object] = {
+            "query": query,
+            "type": "auto",
+            "numResults": 8,
+            "contents": {"highlights": True},
+        }
+        if include_domains:
+            payload["includeDomains"] = include_domains
         response = await client.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": config.tavily_api_key,
-                "query": query,
-                "search_depth": "advanced",
-                "max_results": 6,
-                "include_answer": False,
-                "include_raw_content": False,
+            "https://api.exa.ai/search",
+            headers={
+                "Authorization": f"Bearer {config.exa_api_key}",
+                "Content-Type": "application/json",
             },
-            timeout=35,
+            json=payload,
+            timeout=45,
         )
         response.raise_for_status()
-        return response.json().get("results", [])
-
-
-def chunked(items: list[str], size: int) -> list[list[str]]:
-    return [items[index : index + size] for index in range(0, len(items), size)]
-
-
-async def tavily_extract(
-    client: httpx.AsyncClient, urls: list[str], config: Config
-) -> dict[str, str]:
-    unique_urls = list(dict.fromkeys(url for url in urls if url))
-    if not unique_urls:
-        return {}
-
-    extracted: dict[str, str] = {}
-    batches = chunked(unique_urls, TAVILY_EXTRACT_BATCH_SIZE)
-    for batch_number, batch in enumerate(batches, start=1):
-        try:
-            response = await client.post(
-                "https://api.tavily.com/extract",
-                json={
-                    "api_key": config.tavily_api_key,
-                    "urls": batch,
-                    "extract_depth": "advanced",
-                },
-                timeout=45,
+        mapped_results: list[dict] = []
+        for item in response.json().get("results", []):
+            highlights = item.get("highlights") or []
+            if not isinstance(highlights, list):
+                highlights = []
+            content = "\n".join(str(highlight) for highlight in highlights if highlight)
+            url = str(item.get("url") or "")
+            if not url:
+                continue
+            mapped_results.append(
+                {
+                    "title": str(item.get("title") or ""),
+                    "url": url,
+                    "content": content,
+                    "raw_content": content,
+                    "published_date": item.get("publishedDate"),
+                    "source": domain(url),
+                }
             )
-            response.raise_for_status()
-            payload = response.json()
-            results = payload.get("results", [])
-            for item in results:
-                url = item.get("url")
-                content = item.get("raw_content") or item.get("content") or ""
-                if url and content:
-                    extracted[url] = content[:EXTRACT_CHARS]
-
-            failed_count = len(payload.get("failed_results", []))
-            print(
-                f"[Tavily extract] lote {batch_number}/{len(batches)} "
-                f"procesado: {len(results)} resultados, {failed_count} fallidos"
-            )
-        except httpx.HTTPStatusError as error:
-            print(
-                f"[Tavily extract] lote {batch_number}/{len(batches)} "
-                f"omitido: HTTP {error.response.status_code}"
-            )
-        except httpx.RequestError as error:
-            print(
-                f"[Tavily extract] lote {batch_number}/{len(batches)} "
-                f"omitido: {type(error).__name__}"
-            )
-
-    return extracted
+        return mapped_results
 
 
 def groq_evaluate(result: dict, config: Config) -> dict | None:
@@ -498,6 +462,8 @@ def category_label(item: dict) -> str:
 def safe(value: object, fallback: str = "No informado") -> str:
     return html.escape(str(value or fallback), quote=False)
 
+def safe(value: object, fallback: str = "No informado") -> str:
+    return html.escape(str(value or fallback), quote=False)
 
 def format_panorama(item: dict, verified_at: date) -> str:
     reservation = "Requiere reserva gratuita" if item.get("requiere_reserva") else "Sin reserva"
@@ -652,29 +618,67 @@ async def send_message(client: httpx.AsyncClient, text: str, config: Config) -> 
         await asyncio.sleep(delay)
 
 
+async def telegram_preflight(client: httpx.AsyncClient, config: Config) -> bool:
+    if config.dry_run:
+        return True
+    for attempt in range(1, 3):
+        try:
+            response = await client.get(
+                f"https://api.telegram.org/bot{config.telegram_token}/getMe", timeout=10
+            )
+            response.raise_for_status()
+            return True
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            if status == 401:
+                print("[Telegram preflight] token inválido: HTTP 401")
+                return False
+            print(f"[Telegram preflight] intento {attempt}/2 falló: HTTP {status}")
+        except (httpx.TimeoutException, httpx.RequestError) as error:
+            print(f"[Telegram preflight] intento {attempt}/2 falló: {type(error).__name__}")
+        if attempt < 2:
+            await asyncio.sleep(TELEGRAM_RETRY_BASE_SECONDS)
+    return False
+
+
 async def run(config: Config) -> list[str]:
     queries = build_queries(config)
     semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
     async with httpx.AsyncClient() as client:
+        if not await telegram_preflight(client, config):
+            print("[Telegram preflight] ejecución detenida antes de consultar Exa")
+            return []
         batches = await asyncio.gather(
-            *(tavily_search(client, query, config, semaphore) for query in queries),
+            *(exa_search(client, query, config, semaphore) for query in queries),
             return_exceptions=True,
         )
         by_url: dict[str, dict] = {}
+        successful_queries = 0
         for batch in batches:
             if isinstance(batch, BaseException):
-                print(f"[Tavily] consulta omitida: {type(batch).__name__}")
+                if isinstance(batch, httpx.HTTPStatusError):
+                    print(f"[Exa] consulta omitida: HTTP {batch.response.status_code}")
+                else:
+                    print(f"[Exa] consulta omitida: {type(batch).__name__}")
                 continue
+            successful_queries += 1
             for result in batch:
                 if prefilter(result):
                     by_url.setdefault(str(result.get("url")), result)
+        if successful_queries == 0:
+            print("[Exa] no fue posible consultar las fuentes de panoramas")
+            if config.manual_run:
+                await send_message(
+                    client,
+                    "No fue posible consultar las fuentes de panoramas en esta ejecución.",
+                    config,
+                )
+            return []
         candidates = sorted(
             by_url.values(), key=lambda r: is_official_source(str(r.get("url", ""))), reverse=True
         )[:MAX_CANDIDATES]
-        extracted = await tavily_extract(client, [str(r["url"]) for r in candidates], config)
         accepted = []
         for result in candidates:
-            result["raw_content"] = extracted.get(str(result["url"]), "")
             try:
                 item = groq_evaluate(result, config)
                 valid, reason = validate_panorama(item or {}, config)

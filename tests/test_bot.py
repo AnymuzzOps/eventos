@@ -311,99 +311,198 @@ def test_telegram_logs_no_exponen_token_ni_chat_id(monkeypatch, capsys):
     assert "api.telegram.org" not in logs
 
 
-class ExtractResponse:
-    def __init__(self, payload, status_code=200):
-        self.payload = payload
-        self.status_code = status_code
-        self.request = httpx.Request("POST", "https://api.tavily.com/extract")
-        self.response = httpx.Response(status_code, request=self.request)
+class ExaResponse:
+    def __init__(self, payload=None, status_code=200):
+        request = httpx.Request("POST", "https://api.exa.ai/search")
+        self.response = httpx.Response(status_code, request=request, json=payload or {})
 
     def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                "extract failed", request=self.request, response=self.response
-            )
+        self.response.raise_for_status()
 
     def json(self):
-        return self.payload
+        return self.response.json()
 
 
-class ExtractClient:
-    def __init__(self, responses=None):
-        self.responses = list(responses or [])
+class ExaClient:
+    def __init__(self, response):
+        self.response = response
         self.calls = []
 
-    async def post(self, url, json, timeout):
-        self.calls.append({"url": url, "json": json, "timeout": timeout})
-        if self.responses:
-            return self.responses.pop(0)
-        return ExtractResponse(
-            {"results": [{"url": item, "raw_content": f"content:{item}"} for item in json["urls"]]}
+    async def post(self, url, headers, json, timeout):
+        self.calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        if isinstance(self.response, BaseException):
+            raise self.response
+        return self.response
+
+
+def test_config_lee_exa_sin_exigir_proveedor_anterior(monkeypatch):
+    monkeypatch.setenv("EXA_API_KEY", "exa-secret")
+    monkeypatch.delenv("PREVIOUS_PROVIDER_API_KEY", raising=False)
+    parsed = bot.Config.from_env(require_secrets=False)
+    assert parsed.exa_api_key == "exa-secret"
+    assert set(parsed.__dataclass_fields__).isdisjoint({"previous_provider_api_key"})
+
+
+def test_exa_search_payload_autenticacion_y_mapeo(capsys):
+    config_value = replace(config(), exa_api_key="exa-secret")
+    client = ExaClient(
+        ExaResponse(
+            {
+                "results": [
+                    {
+                        "title": "Evento",
+                        "url": "https://example.com/evento",
+                        "highlights": ["primero", "segundo"],
+                        "publishedDate": "2026-08-01",
+                    },
+                    {"title": "Sin URL", "highlights": ["omitido"]},
+                ]
+            }
         )
+    )
+    results = asyncio.run(bot.exa_search(client, "consulta", config_value, asyncio.Semaphore(1)))
+    call = client.calls[0]
+    assert call["url"] == "https://api.exa.ai/search"
+    assert call["headers"]["Authorization"] == "Bearer exa-secret"
+    assert call["json"] == {
+        "query": "consulta",
+        "type": "auto",
+        "numResults": 8,
+        "contents": {"highlights": True},
+    }
+    assert results == [
+        {
+            "title": "Evento",
+            "url": "https://example.com/evento",
+            "content": "primero\nsegundo",
+            "raw_content": "primero\nsegundo",
+            "published_date": "2026-08-01",
+            "source": "example.com",
+        }
+    ]
+    assert "exa-secret" not in capsys.readouterr().out
 
 
-def test_tavily_extract_divide_45_urls_en_tres_lotes():
-    urls = [f"https://example.com/{index}" for index in range(45)]
-    client = ExtractClient()
-
-    extracted = asyncio.run(bot.tavily_extract(client, urls, config()))
-
-    batches = [call["json"]["urls"] for call in client.calls]
-    assert [len(batch) for batch in batches] == [20, 20, 5]
-    assert all(len(batch) <= bot.TAVILY_EXTRACT_BATCH_SIZE for batch in batches)
-    assert list(extracted) == urls
+def test_build_queries_tiene_exactamente_diez_consultas():
+    assert len(bot.build_queries(config())) == 10
 
 
-def test_tavily_extract_elimina_duplicados_y_conserva_orden():
-    urls = ["https://example.com/1", "https://example.com/2", "https://example.com/1", ""]
-    client = ExtractClient()
+class PreflightClient:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
 
-    asyncio.run(bot.tavily_extract(client, urls, config()))
-
-    assert client.calls[0]["json"]["urls"] == urls[:2]
-
-
-def test_tavily_extract_lista_vacia_no_hace_solicitudes():
-    client = ExtractClient()
-
-    assert asyncio.run(bot.tavily_extract(client, [], config())) == {}
-    assert client.calls == []
+    async def get(self, url, timeout):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
-def test_tavily_extract_conserva_resultados_si_un_lote_falla():
-    urls = [f"https://example.com/{index}" for index in range(45)]
+def test_telegram_preflight_exitoso(monkeypatch):
+    no_wait(monkeypatch)
+    client = PreflightClient([TelegramResponse()])
+    assert asyncio.run(bot.telegram_preflight(client, telegram_config()))
+    assert client.calls == 1
 
-    def successful(batch):
-        return ExtractResponse({"results": [{"url": url, "content": url} for url in batch]})
 
-    client = ExtractClient(
-        [
-            successful(urls[:20]),
-            ExtractResponse({}, status_code=400),
-            successful(urls[40:]),
+def test_telegram_preflight_fallido_detiene_tras_dos_intentos(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = PreflightClient([TelegramResponse(503), TelegramResponse(503)])
+    assert not asyncio.run(bot.telegram_preflight(client, telegram_config()))
+    assert client.calls == 2
+    assert delays == [2]
+
+
+def test_telegram_preflight_dry_run_no_hace_solicitudes(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = PreflightClient([])
+    assert asyncio.run(bot.telegram_preflight(client, telegram_config(dry_run=True)))
+    assert client.calls == 0
+    assert delays == []
+
+
+def test_exa_errores_no_exponen_clave(capsys):
+    config_value = replace(config(), exa_api_key="exa-secret")
+    request = httpx.Request("POST", "https://api.exa.ai/search")
+    response = httpx.Response(429, request=request)
+    client = ExaClient(httpx.HTTPStatusError("quota", request=request, response=response))
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(bot.exa_search(client, "consulta", config_value, asyncio.Semaphore(1)))
+    assert "exa-secret" not in capsys.readouterr().out
+
+
+class RunClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+
+def test_run_deduplica_y_limita_a_20_sin_extraccion(monkeypatch):
+    evaluated = []
+    results = [
+        {
+            "title": f"Evento {index}",
+            "url": f"https://example.com/{index}",
+            "content": "gratis",
+            "raw_content": "gratis",
+        }
+        for index in range(25)
+    ]
+
+    async def fake_exa(*args, **kwargs):
+        return results + [results[0]]
+
+    async def fake_preflight(*args, **kwargs):
+        return True
+
+    def fake_groq(result, config_value):
+        evaluated.append(result["url"])
+        return None
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", RunClient)
+    monkeypatch.setattr(bot, "exa_search", fake_exa)
+    monkeypatch.setattr(bot, "telegram_preflight", fake_preflight)
+    monkeypatch.setattr(bot, "groq_evaluate", fake_groq)
+
+    assert asyncio.run(bot.run(replace(config(), dry_run=True))) == []
+    assert len(evaluated) == bot.MAX_CANDIDATES == 20
+    assert len(set(evaluated)) == 20
+    assert not hasattr(bot, "exa_extract")
+
+
+def test_run_timeout_de_una_consulta_conserva_otras(monkeypatch):
+    calls = 0
+    evaluated = []
+
+    async def fake_exa(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("timeout")
+        return [
+            {
+                "title": "Evento",
+                "url": "https://example.com/evento",
+                "content": "gratis",
+                "raw_content": "gratis",
+            }
         ]
-    )
 
-    extracted = asyncio.run(bot.tavily_extract(client, urls, config()))
+    async def fake_preflight(*args, **kwargs):
+        return True
 
-    assert list(extracted) == urls[:20] + urls[40:]
-    assert len(client.calls) == 3
+    def fake_groq(result, config_value):
+        evaluated.append(result["url"])
+        return None
 
+    monkeypatch.setattr(bot.httpx, "AsyncClient", RunClient)
+    monkeypatch.setattr(bot, "exa_search", fake_exa)
+    monkeypatch.setattr(bot, "telegram_preflight", fake_preflight)
+    monkeypatch.setattr(bot, "groq_evaluate", fake_groq)
 
-def test_tavily_extract_tolera_failed_results():
-    client = ExtractClient(
-        [
-            ExtractResponse(
-                {
-                    "results": [{"url": "https://example.com/ok", "content": "contenido"}],
-                    "failed_results": [{"url": "https://example.com/fail", "error": "failed"}],
-                }
-            )
-        ]
-    )
-
-    extracted = asyncio.run(
-        bot.tavily_extract(client, ["https://example.com/ok", "https://example.com/fail"], config())
-    )
-
-    assert extracted == {"https://example.com/ok": "contenido"}
+    asyncio.run(bot.run(replace(config(), dry_run=True)))
+    assert evaluated == ["https://example.com/evento"]
