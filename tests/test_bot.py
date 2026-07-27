@@ -464,6 +464,7 @@ def test_run_deduplica_y_limita_a_20_sin_extraccion(monkeypatch):
         return None
 
     monkeypatch.setattr(bot.httpx, "AsyncClient", RunClient)
+    monkeypatch.setattr(bot, "create_telegram_client", RunClient)
     monkeypatch.setattr(bot, "exa_search", fake_exa)
     monkeypatch.setattr(bot, "telegram_preflight", fake_preflight)
     monkeypatch.setattr(bot, "groq_evaluate", fake_groq)
@@ -500,9 +501,85 @@ def test_run_timeout_de_una_consulta_conserva_otras(monkeypatch):
         return None
 
     monkeypatch.setattr(bot.httpx, "AsyncClient", RunClient)
+    monkeypatch.setattr(bot, "create_telegram_client", RunClient)
     monkeypatch.setattr(bot, "exa_search", fake_exa)
     monkeypatch.setattr(bot, "telegram_preflight", fake_preflight)
     monkeypatch.setattr(bot, "groq_evaluate", fake_groq)
 
     asyncio.run(bot.run(replace(config(), dry_run=True)))
     assert evaluated == ["https://example.com/evento"]
+
+
+def test_create_telegram_client_desactiva_entorno_y_fuerza_ipv4():
+    client = bot.create_telegram_client()
+    try:
+        assert client._trust_env is False
+        assert client._transport._pool._local_address == "0.0.0.0"
+        assert client._transport._pool._retries == 1
+    finally:
+        asyncio.run(client.aclose())
+
+
+def test_run_usa_clientes_separados_para_exa_y_telegram(monkeypatch):
+    search_client = RunClient()
+    telegram_client = RunClient()
+    observed = {}
+
+    async def fake_preflight(client, config_value):
+        observed["preflight"] = client
+        return True
+
+    async def fake_exa(client, *args, **kwargs):
+        observed.setdefault("search", client)
+        return []
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", lambda: search_client)
+    monkeypatch.setattr(bot, "create_telegram_client", lambda: telegram_client)
+    monkeypatch.setattr(bot, "telegram_preflight", fake_preflight)
+    monkeypatch.setattr(bot, "exa_search", fake_exa)
+
+    asyncio.run(bot.run(replace(config(), dry_run=True)))
+    assert observed == {"preflight": telegram_client, "search": search_client}
+    assert search_client is not telegram_client
+
+
+class ContextPreflightClient(PreflightClient):
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+
+def test_dos_timeouts_de_preflight_fallan_run_sin_consultar_exa(monkeypatch):
+    no_wait(monkeypatch)
+    request = httpx.Request("GET", "https://api.telegram.org/bot-redacted/getMe")
+    telegram_client = ContextPreflightClient(
+        [
+            httpx.ReadTimeout("timeout", request=request),
+            httpx.ReadTimeout("timeout", request=request),
+        ]
+    )
+    exa_called = False
+
+    async def fake_exa(*args, **kwargs):
+        nonlocal exa_called
+        exa_called = True
+        return []
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", RunClient)
+    monkeypatch.setattr(bot, "create_telegram_client", lambda: telegram_client)
+    monkeypatch.setattr(bot, "exa_search", fake_exa)
+
+    with pytest.raises(RuntimeError, match="Telegram no está disponible"):
+        asyncio.run(bot.run(telegram_config()))
+    assert telegram_client.calls == 2
+    assert not exa_called
+
+
+def test_preflight_401_se_detiene_inmediatamente(monkeypatch):
+    delays = no_wait(monkeypatch)
+    client = PreflightClient([TelegramResponse(401)])
+    assert not asyncio.run(bot.telegram_preflight(client, telegram_config()))
+    assert client.calls == 1
+    assert delays == []

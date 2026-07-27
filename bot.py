@@ -462,8 +462,6 @@ def category_label(item: dict) -> str:
 def safe(value: object, fallback: str = "No informado") -> str:
     return html.escape(str(value or fallback), quote=False)
 
-def safe(value: object, fallback: str = "No informado") -> str:
-    return html.escape(str(value or fallback), quote=False)
 
 def format_panorama(item: dict, verified_at: date) -> str:
     reservation = "Requiere reserva gratuita" if item.get("requiere_reserva") else "Sin reserva"
@@ -566,6 +564,23 @@ def select_updates(items: list[dict], history: dict[str, dict], force: bool = Fa
     return updates
 
 
+def create_telegram_client() -> httpx.AsyncClient:
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=1)
+    timeout = httpx.Timeout(
+        timeout=30.0,
+        connect=10.0,
+        read=30.0,
+        write=20.0,
+        pool=10.0,
+    )
+    return httpx.AsyncClient(
+        transport=transport,
+        timeout=timeout,
+        trust_env=False,
+        follow_redirects=True,
+    )
+
+
 async def send_message(client: httpx.AsyncClient, text: str, config: Config) -> None:
     if config.dry_run:
         print(text)
@@ -582,7 +597,7 @@ async def send_message(client: httpx.AsyncClient, text: str, config: Config) -> 
                     "parse_mode": "HTML",
                     "disable_web_page_preview": False,
                 },
-                timeout=20,
+                timeout=30,
             )
             response.raise_for_status()
             print(f"[Telegram] intento {attempt}/{TELEGRAM_MAX_ATTEMPTS} enviado correctamente")
@@ -624,14 +639,15 @@ async def telegram_preflight(client: httpx.AsyncClient, config: Config) -> bool:
     for attempt in range(1, 3):
         try:
             response = await client.get(
-                f"https://api.telegram.org/bot{config.telegram_token}/getMe", timeout=10
+                f"https://api.telegram.org/bot{config.telegram_token}/getMe", timeout=20
             )
             response.raise_for_status()
             return True
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
-            if status == 401:
-                print("[Telegram preflight] token inválido: HTTP 401")
+            if status in {401, 403, 404}:
+                label = "token inválido" if status == 401 else "error permanente"
+                print(f"[Telegram preflight] {label}: HTTP {status}")
                 return False
             print(f"[Telegram preflight] intento {attempt}/2 falló: HTTP {status}")
         except (httpx.TimeoutException, httpx.RequestError) as error:
@@ -644,12 +660,15 @@ async def telegram_preflight(client: httpx.AsyncClient, config: Config) -> bool:
 async def run(config: Config) -> list[str]:
     queries = build_queries(config)
     semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
-    async with httpx.AsyncClient() as client:
-        if not await telegram_preflight(client, config):
+    async with (
+        httpx.AsyncClient() as search_client,
+        create_telegram_client() as telegram_client,
+    ):
+        if not await telegram_preflight(telegram_client, config):
             print("[Telegram preflight] ejecución detenida antes de consultar Exa")
-            return []
+            raise RuntimeError("Telegram no está disponible desde el runner")
         batches = await asyncio.gather(
-            *(exa_search(client, query, config, semaphore) for query in queries),
+            *(exa_search(search_client, query, config, semaphore) for query in queries),
             return_exceptions=True,
         )
         by_url: dict[str, dict] = {}
@@ -669,7 +688,7 @@ async def run(config: Config) -> list[str]:
             print("[Exa] no fue posible consultar las fuentes de panoramas")
             if config.manual_run:
                 await send_message(
-                    client,
+                    telegram_client,
                     "No fue posible consultar las fuentes de panoramas en esta ejecución.",
                     config,
                 )
@@ -696,15 +715,15 @@ async def run(config: Config) -> list[str]:
         messages = grouped_messages(updates, datetime.now(CHILE_TZ).date())
         if updates:
             summary = f"💑 <b>Panoramas gratuitos</b>\n\nEncontré <b>{len(updates)}</b> nuevos panoramas gratuitos en {safe(config.city)} y {safe(config.region)}."
-            await send_message(client, summary, config)
+            await send_message(telegram_client, summary, config)
             for message in messages:
-                await send_message(client, message, config)
+                await send_message(telegram_client, message, config)
             if not config.dry_run:
                 for item in updates:
                     save_history(item)
         elif config.manual_run:
             await send_message(
-                client,
+                telegram_client,
                 "💑 <b>Panoramas gratuitos</b>\n\nNo encontré novedades verificadas.",
                 config,
             )
