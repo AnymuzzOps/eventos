@@ -41,7 +41,7 @@ concurrency:
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 25
     env:
       EVENT_START_DATE: ${{ inputs.start_date || '2026-08-01' }}
