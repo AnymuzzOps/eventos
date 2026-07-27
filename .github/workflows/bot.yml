@@ -39,13 +39,6 @@ concurrency:
   group: panoramas-gratuitos
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
-concurrency:
-  group: eventos-bot
-  cancel-in-progress: false
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -84,7 +77,7 @@ jobs:
 
       - name: Run bot
         env:
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
