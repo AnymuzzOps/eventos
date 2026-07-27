@@ -309,3 +309,101 @@ def test_telegram_logs_no_exponen_token_ni_chat_id(monkeypatch, capsys):
     assert "secret-token" not in logs
     assert "secret-chat-id" not in logs
     assert "api.telegram.org" not in logs
+
+
+class ExtractResponse:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+        self.request = httpx.Request("POST", "https://api.tavily.com/extract")
+        self.response = httpx.Response(status_code, request=self.request)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                "extract failed", request=self.request, response=self.response
+            )
+
+    def json(self):
+        return self.payload
+
+
+class ExtractClient:
+    def __init__(self, responses=None):
+        self.responses = list(responses or [])
+        self.calls = []
+
+    async def post(self, url, json, timeout):
+        self.calls.append({"url": url, "json": json, "timeout": timeout})
+        if self.responses:
+            return self.responses.pop(0)
+        return ExtractResponse(
+            {"results": [{"url": item, "raw_content": f"content:{item}"} for item in json["urls"]]}
+        )
+
+
+def test_tavily_extract_divide_45_urls_en_tres_lotes():
+    urls = [f"https://example.com/{index}" for index in range(45)]
+    client = ExtractClient()
+
+    extracted = asyncio.run(bot.tavily_extract(client, urls, config()))
+
+    batches = [call["json"]["urls"] for call in client.calls]
+    assert [len(batch) for batch in batches] == [20, 20, 5]
+    assert all(len(batch) <= bot.TAVILY_EXTRACT_BATCH_SIZE for batch in batches)
+    assert list(extracted) == urls
+
+
+def test_tavily_extract_elimina_duplicados_y_conserva_orden():
+    urls = ["https://example.com/1", "https://example.com/2", "https://example.com/1", ""]
+    client = ExtractClient()
+
+    asyncio.run(bot.tavily_extract(client, urls, config()))
+
+    assert client.calls[0]["json"]["urls"] == urls[:2]
+
+
+def test_tavily_extract_lista_vacia_no_hace_solicitudes():
+    client = ExtractClient()
+
+    assert asyncio.run(bot.tavily_extract(client, [], config())) == {}
+    assert client.calls == []
+
+
+def test_tavily_extract_conserva_resultados_si_un_lote_falla():
+    urls = [f"https://example.com/{index}" for index in range(45)]
+
+    def successful(batch):
+        return ExtractResponse({"results": [{"url": url, "content": url} for url in batch]})
+
+    client = ExtractClient(
+        [
+            successful(urls[:20]),
+            ExtractResponse({}, status_code=400),
+            successful(urls[40:]),
+        ]
+    )
+
+    extracted = asyncio.run(bot.tavily_extract(client, urls, config()))
+
+    assert list(extracted) == urls[:20] + urls[40:]
+    assert len(client.calls) == 3
+
+
+def test_tavily_extract_tolera_failed_results():
+    client = ExtractClient(
+        [
+            ExtractResponse(
+                {
+                    "results": [{"url": "https://example.com/ok", "content": "contenido"}],
+                    "failed_results": [{"url": "https://example.com/fail", "error": "failed"}],
+                }
+            )
+        ]
+    )
+
+    extracted = asyncio.run(
+        bot.tavily_extract(client, ["https://example.com/ok", "https://example.com/fail"], config())
+    )
+
+    assert extracted == {"https://example.com/ok": "contenido"}
